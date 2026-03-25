@@ -617,6 +617,7 @@ def plot_pca_scatter(
     fig, ax = plt.subplots(figsize=(10, 8))
 
     if face_crops is not None and face_size is not None:
+        ax.scatter(scores[:, 0], scores[:, 1], alpha=0)
         # Draw thumbnail images at each point (replicates the assignment figure)
         from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
