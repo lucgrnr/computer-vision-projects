@@ -31,6 +31,7 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+from sklearn.manifold import TSNE
 
 # Default class label mapping used throughout the assignment
 DEFAULT_CLASS_NAMES = {0: "Michael/Sarah", 1: "Jesse", 2: "Mila"}
@@ -120,51 +121,58 @@ def plot_image_sequence(
 def plot_face_debug(
     data,
     face_array: np.ndarray,
-    label_array: np.ndarray,
-    class_id: int,
+    label_array: np.ndarray = None,  # Made optional
+    class_id: int = None,  # Made optional
     n: int = 10,
     class_names: dict = None,
 ) -> None:
     """
     Shows each original image next to its extracted face crop.
-    Useful for validating that the face detector is picking the right person.
-
-    Parameters
-    ----------
-    data        : DataFrame with an 'img' column (raw images)
-    face_array  : preprocessed face crops, shape (N, H, W, 3)
-    label_array : integer class labels aligned with face_array
-    class_id    : which class to visualise
-    n           : how many pairs to show
+    Works for both labeled training data and unlabeled test data.
     """
-    class_names = _resolve_class_names(class_names)
-    indices = np.where(label_array == class_id)[0]
-    n = min(n, len(indices))
+    # 1. Determine which indices to plot
+    if label_array is not None and class_id is not None:
+        # Labeled mode: filter by class
+        class_names = _resolve_class_names(class_names)
+        indices = np.where(label_array == class_id)[0]
+        suptitle = f"Class {class_id} — {class_names.get(class_id, class_id)}"
+    else:
+        # Unlabeled/Test mode: just take the first n samples
+        indices = np.arange(len(face_array))
+        suptitle = "Unlabeled / Test Data Samples"
 
-    fig, axes = plt.subplots(n, 2, figsize=(6, 2.5 * n))
+    # 2. Limit n to available data
+    n = min(n, len(indices))
+    if n == 0:
+        print("No samples found to plot.")
+        return
+
+    # 3. Create plot
+    fig, axes = plt.subplots(n, 2, figsize=(6, 3 * n))
+
     # Handle edge case of a single row
     if n == 1:
         axes = axes[np.newaxis, :]
 
-    fig.suptitle(
-        f"Class {class_id} — {class_names.get(class_id, class_id)} " f"({n} samples)",
-        fontsize=12,
-    )
+    fig.suptitle(f"{suptitle} ({n} samples)", fontsize=12, y=1.02)
 
     for row, idx in enumerate(indices[:n]):
-        # Left: original image
+        # Left: original image from the DataFrame
         orig = data.iloc[idx]["img"]
         axes[row, 0].imshow(_to_display(orig.astype(np.float32)))
-        axes[row, 0].set_title(f"Original #{idx}", fontsize=8)
+        axes[row, 0].set_title(f"Original Index #{idx}", fontsize=8)
         axes[row, 0].axis("off")
 
-        # Right: extracted face crop
+        # Right: extracted face crop from the array
         face = face_array[idx]
         if _is_nan_face(face):
-            axes[row, 1].set_title("No face detected", fontsize=8, color="red")
+            axes[row, 1].text(
+                0.5, 0.5, "No face detected", ha="center", va="center", color="red"
+            )
+            axes[row, 1].set_title("Detection Failed", fontsize=8, color="red")
         else:
             axes[row, 1].imshow(_to_display(face))
-            axes[row, 1].set_title("Extracted face", fontsize=8, color="green")
+            axes[row, 1].set_title("Extracted Face", fontsize=8, color="green")
         axes[row, 1].axis("off")
 
     plt.tight_layout()
@@ -441,22 +449,13 @@ def plot_tsne(
     random_state: int = 42,
 ) -> None:
     """
-    2-D t-SNE scatter plot of *features* coloured by class.
-
-    A well-separated plot means the feature representation is discriminative
-    (different classes cluster apart) and robust (same class forms a tight
-    cluster despite image variation).
-
-    Parameters
-    ----------
-    features     : feature matrix, shape (N, D)
-    label_array  : integer labels, shape (N,)
-    perplexity   : t-SNE perplexity — with only 80 training samples,
-                   keep this low (5–15). Default 10.
+    2-D t-SNE scatter plot of *features* coloured by class with high-contrast distinct colors.
     """
-    from sklearn.manifold import TSNE
-
-    class_names = _resolve_class_names(class_names)
+    # Ensure class_names is a dictionary
+    if isinstance(class_names, list):
+        class_names = {i: name for i, name in enumerate(class_names)}
+    elif class_names is None:
+        class_names = {}
 
     print(f"Running t-SNE (perplexity={perplexity}) on {features.shape} ...")
     tsne = TSNE(
@@ -464,28 +463,49 @@ def plot_tsne(
     )
     coords = tsne.fit_transform(features)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(10, 8))
     classes = sorted(np.unique(label_array))
 
-    for cls in classes:
+    # Define a custom, highly distinct color palette for up to 10 classes
+    # We use a specific dark gray for the "Not_A_Face" class (usually class 4)
+    distinct_colors = {
+        0: "#1f77b4",  # Blue (Michael)
+        1: "#ff7f0e",  # Orange (Jesse)
+        2: "#2ca02c",  # Green (Mila)
+        3: "#d62728",  # Red (Sarah)
+        4: "#7f7f7f",  # Gray (Not_A_Face - makes it recede as background noise)
+        5: "#9467bd",  # Purple
+        6: "#8c564b",  # Brown
+        7: "#e377c2",  # Pink
+    }
+
+    for i, cls in enumerate(classes):
         mask = label_array == cls
-        colour = CLASS_COLOURS.get(cls, None)
+
+        # Grab the color from our distinct dictionary, or fall back to a random hex if we exceed 8 classes
+        colour = distinct_colors.get(cls, f"#{np.random.randint(0, 0xFFFFFF):06x}")
+
+        # Determine the label name
+        label_name = class_names.get(cls, f"Class {cls}")
+
         ax.scatter(
             coords[mask, 0],
             coords[mask, 1],
             c=colour,
-            label=class_names.get(cls, str(cls)),
-            s=60,
-            alpha=0.8,
+            label=label_name,
+            s=80,  # Made the dots slightly larger for better visibility
+            alpha=0.85,
             edgecolors="white",
             linewidths=0.5,
         )
 
-    ax.legend(fontsize=10, framealpha=0.9)
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel("t-SNE dim 1")
-    ax.set_ylabel("t-SNE dim 2")
+    # Move legend outside the plot so it doesn't cover up data points
+    ax.legend(fontsize=10, framealpha=1.0, loc="center left", bbox_to_anchor=(1, 0.5))
+    ax.set_title(title, fontsize=14, pad=15)
+    ax.set_xlabel("t-SNE dim 1", fontsize=11)
+    ax.set_ylabel("t-SNE dim 2", fontsize=11)
     ax.spines[["top", "right"]].set_visible(False)
+
     plt.tight_layout()
     plt.show()
 

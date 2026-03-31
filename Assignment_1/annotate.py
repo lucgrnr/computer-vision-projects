@@ -574,8 +574,20 @@ class FaceAnnotator:
             plt.show()
 
         # ── Plot 2: multi-face expansions ─────────────────────────────
-        label_colours = {0: "#4C72B0", 1: "#DD8452", 2: "#55A868"}
-        label_names = {0: "Michael/Sarah", 1: "Jesse", 2: "Mila"}
+        label_colours = {
+            0: "#DD8452",
+            1: "#55A868",
+            2: "#4C72B0",
+            3: "#E15759",
+            4: "#76B7B2",
+        }
+        label_names = {
+            0: "Jesse",
+            1: "Mila",
+            2: "Michael",
+            3: "Sarah",
+            4: "Other",
+        }
 
         for orig_idx, entries in multi_data.items():
             orig_img = train_df.iloc[orig_idx]["img"]
@@ -836,6 +848,166 @@ def save_multi_annotations(annotations):
         json.dump(annotations, f, indent=2)
 
 
+EXTRACTED_LABELS_PATH = "extracted_labels.json"
+
+
+def load_extracted_labels(path=EXTRACTED_LABELS_PATH):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_extracted_labels(labels, path=EXTRACTED_LABELS_PATH):
+    with open(path, "w") as f:
+        json.dump(labels, f, indent=2)
+
+
+def label_extracted_face(image_path, existing_label=None):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Unable to load image '{image_path}'")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    LABEL_NAMES = {
+        0: "Jesse",
+        1: "Mila",
+        2: "Michael",
+        3: "Sarah",
+        4: "Other",
+    }
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    fig.patch.set_facecolor("#1a1a1a")
+    ax.imshow(img)
+    ax.axis("off")
+
+    title = os.path.basename(image_path)
+    if existing_label is not None:
+        title += f"  | current: {LABEL_NAMES.get(existing_label, existing_label)}"
+    title += "\nPress 0=Jesse 1=Mila 2=Michael 3=Sarah 4=Other  " "S=skip  Q=quit"
+    fig.suptitle(title, color="white", fontsize=10)
+
+    state = {"action": None, "label": existing_label}
+
+    def on_key(event):
+        key = event.key
+        if key in ("0", "1", "2", "3", "4"):
+            state["label"] = int(key)
+            state["action"] = "confirmed"
+            plt.close(fig)
+        elif key == "s":
+            state["action"] = "skipped"
+            plt.close(fig)
+        elif key == "q":
+            state["action"] = "quit"
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    plt.show()
+
+    return state["action"], state["label"]
+
+
+def run_extracted_labeling(folder, labels_path=EXTRACTED_LABELS_PATH):
+    labels = load_extracted_labels(labels_path)
+    image_paths = []
+
+    for root, _, files in os.walk(folder):
+        for filename in sorted(files):
+            if filename.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+            ):
+                image_paths.append(os.path.join(root, filename))
+
+    if not image_paths:
+        print(f"No images found in '{folder}'")
+        return
+
+    print(f"Labeling {len(image_paths)} images from '{folder}'")
+    for image_path in image_paths:
+        key = os.path.relpath(image_path, folder)
+        existing = labels.get(key)
+        status = f"(current={existing})" if existing is not None else ""
+        print(f"Image: {key} {status}")
+
+        action, label = label_extracted_face(image_path, existing)
+        if action == "confirmed":
+            labels[key] = label
+            save_extracted_labels(labels, labels_path)
+            print(f"  Saved label {label} for {key}")
+        elif action == "skipped":
+            print("  Skipped.")
+        elif action == "quit":
+            print("  Session ended.")
+            break
+
+    print(f"Done. {len(labels)} images labeled in '{labels_path}'")
+
+
+def save_labeled_extracted_faces(
+    source_folder,
+    labels_path=EXTRACTED_LABELS_PATH,
+    output_dir="labeled_extracted_faces",
+):
+    labels = load_extracted_labels(labels_path)
+    if not labels:
+        print(f"No labels found in '{labels_path}'")
+        return
+
+    LABEL_NAMES = {
+        0: "Jesse",
+        1: "Mila",
+        2: "Michael",
+        3: "Sarah",
+        4: "Other",
+    }
+
+    for name in LABEL_NAMES.values():
+        os.makedirs(os.path.join(output_dir, name), exist_ok=True)
+
+    saved = 0
+    missing = 0
+    metadata = []
+
+    for relpath, label in labels.items():
+        src_path = os.path.join(source_folder, relpath)
+        if not os.path.exists(src_path):
+            missing += 1
+            print(f"Missing image: {src_path}")
+            continue
+
+        class_folder = LABEL_NAMES.get(label, f"class_{label}")
+        dst_dir = os.path.join(output_dir, class_folder)
+        os.makedirs(dst_dir, exist_ok=True)
+
+        dst_path = os.path.join(dst_dir, os.path.basename(relpath))
+        img = cv2.imread(src_path)
+        if img is None:
+            missing += 1
+            print(f"Unable to read image: {src_path}")
+            continue
+
+        cv2.imwrite(dst_path, img)
+        saved += 1
+        metadata.append(
+            {
+                "source": src_path,
+                "file": os.path.join(class_folder, os.path.basename(relpath)),
+                "label": label,
+                "class_name": LABEL_NAMES.get(label, str(label)),
+            }
+        )
+
+    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(
+        f"Saved {saved} labeled images to '{output_dir}'"
+        + (f" ({missing} missing)" if missing else "")
+    )
+
+
 def annotate_multi_face(idx, row, existing_annotations):
     """
     Opens a matplotlib window for image *idx* and lets you draw
@@ -844,8 +1016,8 @@ def annotate_multi_face(idx, row, existing_annotations):
     Controls
     --------
     Click + drag    : draw a bounding box
-    0 / 1 / 2       : assign label to the LAST drawn box
-                      0 = Michael/Sarah, 1 = Jesse, 2 = Mila
+    0 / 1 / 2 / 3 / 4 : assign label to the LAST drawn box
+                        0 = Jesse, 1 = Mila, 2 = Michael, 3 = Sarah, 4 = Other
     ENTER           : save all boxes and move to next image
     R               : remove the last drawn box
     C               : clear all boxes
@@ -859,7 +1031,7 @@ def annotate_multi_face(idx, row, existing_annotations):
 
     fig.suptitle(
         f"Image #{idx}  |  {row['name']}  |  {img_w}x{img_h}px\n"
-        f"Draw boxes, then press 0/1/2 to label last box  "
+        f"Draw boxes, then press 0/1/2/3/4 to label last box  "
         f"|  ENTER=save  R=remove last  C=clear all  Q=quit",
         color="white",
         fontsize=10,
@@ -879,11 +1051,28 @@ def annotate_multi_face(idx, row, existing_annotations):
     ax.set_title("Draw a box around each face", color="white", fontsize=9)
     ax.axis("off")
 
+    # Label colours and names
+    LABEL_COLOURS = {
+        0: "#DD8452",
+        1: "#55A868",
+        2: "#4C72B0",
+        3: "#E15759",
+        4: "#76B7B2",
+    }
+    LABEL_NAMES = {
+        0: "Jesse",
+        1: "Mila",
+        2: "Michael",
+        3: "Sarah",
+        4: "Other",
+    }
+
     # Show existing annotations for this image
     if idx in existing_annotations:
         for entry in existing_annotations[idx]:
             x, y, w, h, label = entry
-            colour = ["#4C72B0", "#DD8452", "#55A868"][label]
+            colour = LABEL_COLOURS.get(label, "white")
+            name = LABEL_NAMES.get(label, str(label))
             ax.add_patch(
                 patches.Rectangle(
                     (x, y),
@@ -896,12 +1085,13 @@ def annotate_multi_face(idx, row, existing_annotations):
                 )
             )
             ax.text(
-                x, y - 5, f"class {label}", color=colour, fontsize=8, fontweight="bold"
+                x,
+                y - 5,
+                f"{name} ({label})",
+                color=colour,
+                fontsize=8,
+                fontweight="bold",
             )
-
-    # Label colours and names
-    LABEL_COLOURS = {0: "#4C72B0", 1: "#DD8452", 2: "#55A868"}
-    LABEL_NAMES = {0: "Michael/Sarah", 1: "Jesse", 2: "Mila"}
 
     # State: list of dicts {box, label, patch, text}
     state = {"boxes": [], "action": None}
@@ -943,7 +1133,7 @@ def annotate_multi_face(idx, row, existing_annotations):
         if w < 5 or h < 5:
             return
 
-        # Draw box in white (unlabelled) until user presses 0/1/2
+        # Draw box in white (unlabelled) until user presses 0/1/2/3/4
         patch = patches.Rectangle(
             (x1, y1), w, h, linewidth=2, edgecolor="white", facecolor="none"
         )
@@ -965,14 +1155,14 @@ def annotate_multi_face(idx, row, existing_annotations):
         update_legend()
         print(
             f"  Box {len(state['boxes'])} drawn: x={x1} y={y1} w={w} h={h}"
-            f" — press 0, 1, or 2 to label it"
+            f" — press 0, 1, 2, 3, or 4 to label it"
         )
 
     def on_key(event):
         key = event.key
 
         # Label the last drawn box
-        if key in ("0", "1", "2"):
+        if key in ("0", "1", "2", "3", "4"):
             if not state["boxes"]:
                 print("  Draw a box first.")
                 return
@@ -1015,7 +1205,7 @@ def annotate_multi_face(idx, row, existing_annotations):
             if unlabelled:
                 print(
                     f"  {len(unlabelled)} box(es) have no label — "
-                    f"press 0/1/2 to label them before confirming."
+                    f"press 0/1/2/3/4 to label them before confirming."
                 )
                 return
             if not state["boxes"]:
@@ -1118,7 +1308,7 @@ def main():
     # ── Multi-face expansion ─────────────────────────────────────────
     print(f"\nMulti-face annotation for images: {MULTI_ANNOTATION_INDICES}")
     print(
-        "Controls: draw box → 0/1/2 to label → ENTER=save  R=remove last  C=clear  Q=quit\n"
+        "Controls: draw box → 0/1/2/3/4 to label → ENTER=save  R=remove last  C=clear  Q=quit\n"
     )
 
     for i, idx in enumerate(MULTI_ANNOTATION_INDICES):
