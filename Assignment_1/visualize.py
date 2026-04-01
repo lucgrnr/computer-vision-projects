@@ -121,10 +121,11 @@ def plot_image_sequence(
 def plot_face_debug(
     data,
     face_array: np.ndarray,
-    label_array: np.ndarray = None,  # Made optional
-    class_id: int = None,  # Made optional
+    label_array: np.ndarray = None,
+    class_id: int = None,
     n: int = 10,
     class_names: dict = None,
+    pairs_per_row: int = 3,  # NEW: Controls how many pairs are shown horizontally
 ) -> None:
     """
     Shows each original image next to its extracted face crop.
@@ -133,7 +134,9 @@ def plot_face_debug(
     # 1. Determine which indices to plot
     if label_array is not None and class_id is not None:
         # Labeled mode: filter by class
-        class_names = _resolve_class_names(class_names)
+        # (Assuming _resolve_class_names handles None appropriately, fallback used just in case)
+        if class_names is None:
+            class_names = {}
         indices = np.where(label_array == class_id)[0]
         suptitle = f"Class {class_id} — {class_names.get(class_id, class_id)}"
     else:
@@ -147,33 +150,48 @@ def plot_face_debug(
         print("No samples found to plot.")
         return
 
-    # 3. Create plot
-    fig, axes = plt.subplots(n, 2, figsize=(6, 3 * n))
+    # 3. Create grid layout
+    num_rows = math.ceil(n / pairs_per_row)
+    actual_cols = min(n, pairs_per_row) * 2  # 2 columns per pair (Original + Crop)
 
-    # Handle edge case of a single row
-    if n == 1:
-        axes = axes[np.newaxis, :]
+    # Adjust figsize to keep images square but tile them horizontally
+    fig, axes = plt.subplots(
+        num_rows, actual_cols, figsize=(2.5 * actual_cols, 3 * num_rows)
+    )
 
-    fig.suptitle(f"{suptitle} ({n} samples)", fontsize=12, y=1.02)
+    # Flatten axes array for easier linear iteration
+    if isinstance(axes, np.ndarray):
+        axes = axes.flatten()
+    else:
+        axes = [axes]
 
-    for row, idx in enumerate(indices[:n]):
+    fig.suptitle(f"{suptitle} ({n} samples)", fontsize=14, y=1.02)
+
+    # Hide all axes initially (useful for empty subplots in the last row)
+    for ax in axes:
+        ax.axis("off")
+
+    # 4. Plot images
+    for i, idx in enumerate(indices[:n]):
+        # Calculate the 1D index for the left (original) and right (face) subplots
+        orig_idx = 2 * i
+        face_idx = 2 * i + 1
+
         # Left: original image from the DataFrame
         orig = data.iloc[idx]["img"]
-        axes[row, 0].imshow(_to_display(orig.astype(np.float32)))
-        axes[row, 0].set_title(f"Original Index #{idx}", fontsize=8)
-        axes[row, 0].axis("off")
+        axes[orig_idx].imshow(_to_display(orig.astype(np.float32)))
+        axes[orig_idx].set_title(f"Orig #{idx}", fontsize=9)
 
         # Right: extracted face crop from the array
         face = face_array[idx]
         if _is_nan_face(face):
-            axes[row, 1].text(
-                0.5, 0.5, "No face detected", ha="center", va="center", color="red"
+            axes[face_idx].text(
+                0.5, 0.5, "No face", ha="center", va="center", color="red"
             )
-            axes[row, 1].set_title("Detection Failed", fontsize=8, color="red")
+            axes[face_idx].set_title("Detection Failed", fontsize=9, color="red")
         else:
-            axes[row, 1].imshow(_to_display(face))
-            axes[row, 1].set_title("Extracted Face", fontsize=8, color="green")
-        axes[row, 1].axis("off")
+            axes[face_idx].imshow(_to_display(face))
+            axes[face_idx].set_title("Extracted", fontsize=9, color="green")
 
     plt.tight_layout()
     plt.show()
