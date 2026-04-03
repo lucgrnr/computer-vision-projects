@@ -209,7 +209,6 @@ __marimo__/
 
 # Specifically ignore your data folders to be safe
 Assignment_1/raw_images/
-Assignment_1/extracted_faces/
 Assignment_1/dnn_prepped_data/
 Assignment_1/haar_prepped_data/
 Assignment_1/haar_extracted_faces/
