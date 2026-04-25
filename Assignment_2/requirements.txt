@@ -1,0 +1,44 @@
+# requirements.txt — KU Leuven CV H02A5a · Group Assignment 2 (Group 27)
+#
+# These pins are compatible with:
+#   • Kaggle's late-2025 Python image (kaggle/python, Python 3.10/3.11)
+#   • Azure ML Compute (Linux x86_64, Python 3.10) used for training
+#
+# Most of these are already installed on Kaggle. Only `iterative-stratification`
+# typically needs an explicit pip install. The pin on `albumentations<2.0`
+# is important — version 2.x bumps NumPy to 2.x, which conflicts with the
+# rest of Kaggle's stack (and with Azure ML's azureml-* packages).
+#
+# To install on a fresh environment:
+#     pip install -r requirements.txt
+# Or, on Kaggle (typically only this is needed):
+#     pip install -q "albumentations>=1.4,<2.0" "iterative-stratification>=0.1.9"
+
+# ── Core scientific stack ─────────────────────────────────────
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.13.1
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# ── Deep-learning ────────────────────────────────────────────
+# torch / torchvision: ImageNet-pretrained ResNet-50 backbone for the
+# transfer-learning classifier. ResNet50_Weights.IMAGENET1K_V2 (ILSVRC 2012),
+# no PASCAL VOC overlap → satisfies the assignment's "no VOC-pretrained
+# weights" hard constraint.
+torch==2.4.1
+torchvision==0.19.1
+
+# ── Evaluation utilities ─────────────────────────────────────
+# scikit-learn provides average_precision_score (used as the val-mAP metric).
+scikit-learn==1.5.2
+
+# ── Augmentation pipeline ────────────────────────────────────
+# Albumentations: train-time RandomResizedCrop + HorizontalFlip + ColorJitter,
+# val/test-time deterministic Resize + ImageNet Normalize.
+# Pinned to 1.x to keep NumPy 1.x.
+albumentations==1.4.24
+opencv-python-headless==4.10.0.84
+
+# ── Multi-label stratified k-fold (Section 1.1.5 / 1.2) ──────
+iterative-stratification==0.1.9
