@@ -465,27 +465,10 @@ def get_transforms(model_name):
             ToTensorV2(),
         ])
         
-    elif model_name == "unet":
+    elif model_name in ["unet", "mask2former"]:
         crop_size = 256
-        train_tf = A.Compose([
-            A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=0, fill=0, fill_mask=255),
-            A.RandomScale(scale_limit=(-0.2, 0.5), p=1.0), 
-            A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=0, fill=0, fill_mask=255),
-            A.RandomCrop(height=crop_size, width=crop_size, p=1.0),
-            A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
-            A.Normalize(mean=active_mean, std=active_std),
-            ToTensorV2(),
-        ])
-        val_tf = A.Compose([
-            A.LongestMaxSize(max_size=crop_size, p=1.0),
-            A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=cv2.BORDER_CONSTANT, fill=MEAN_C, fill_mask=255),
-            A.Normalize(mean=active_mean, std=active_std),
-            ToTensorV2(),
-        ])
         
-    elif model_name == "mask2former":
-        crop_size = 256
+        # Use a slightly more robust M2F-style pipeline for both
         train_tf = A.Compose([
             A.LongestMaxSize(max_size=int(crop_size * 1.5), p=1.0),
             A.RandomScale(scale_limit=(-0.2, 0.5), p=1.0), 
@@ -493,9 +476,10 @@ def get_transforms(model_name):
             A.RandomCrop(height=crop_size, width=crop_size),
             A.HorizontalFlip(p=0.5),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-            A.Normalize(mean=active_mean, std=active_std),
+            A.Normalize(mean=active_mean, std=active_std), # This handles the difference!
             ToTensorV2(),
         ])
+        
         val_tf = A.Compose([
             A.LongestMaxSize(max_size=crop_size, p=1.0),
             A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=cv2.BORDER_CONSTANT, fill=MEAN_C, fill_mask=255),
@@ -877,7 +861,11 @@ else:
 
 if 'val_logits_clip' in locals():
     thresholds_clip, dice_clip = tune_thresholds(val_logits_clip, val_targets_clip)
-    print(f"CLIP ViT-B/16 mean Dice: {dice_clip.mean():.4f}")
+    print("\n--- CLIP Validation Results ---\n")
+    print(f"Mean Dice: {dice_clip.mean():.4f}", "\n")
+    
+    for i, label in enumerate(labels):
+        print(f"{label:>15}: {dice_clip[i]:.4f}")
 
 # %%
 visualize_classification(model_clip, val_loader_clip, val_df_cls)
@@ -1245,6 +1233,12 @@ if TRAIN:
 else:
     if Path("best_mask2former.pt").exists():
         hf_m2f.load_state_dict(torch.load("best_mask2former.pt", map_location=device))
+
+print("\n--- Mask2Former Validation Results ---\n")
+_, m2f_val_result = evaluate_m2f(hf_m2f, val_loader_m2f, device)
+print(f"{'Mean Dice':>15}: {m2f_val_result['mean_dice']:.4f}", "\n")
+for i, cls_name in enumerate(VOC_CLASSES):
+    print(f"{cls_name:>15}: {m2f_val_result['per_class_dice'][i]:.4f}")
 
 # %%
 visualize_segmentation(hf_m2f, val_loader_m2f, save_name="best_mask2former", voc_classes=VOC_CLASSES)
