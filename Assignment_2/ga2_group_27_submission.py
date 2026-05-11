@@ -41,8 +41,33 @@
 # Verify that the DATA_PATH variable is correctly set to the location of your dataset.
 DATA_PATH = '' # for Github
 #DATA_PATH = '/kaggle/input/kul-computer-vision-ga-2-2026' # for Kaggle
+
 TRAIN = True # Set to False to load pre-trained weights instead of training
 SMOKE = False # Set to True for quick plumbing checks
+
+VRAM_GB = 8 # Set your available GPU VRAM in GB here
+NUM_WORKERS = 6 # set equal no cores for Linux, 0 recommended for Windows
+
+
+# Optimal values for low VRAM usages models
+SCNN_BATCH_SIZE = 128
+CLIP_BATCH_SIZE = 32
+
+# Dynamic btach values based on VRAM
+if VRAM_GB <= 8:
+    # U-Net Effective 16
+    UNET_BATCH_SIZE = 16 
+    UNET_ACCUM_STEPS = 1
+    # M2F Effective 16
+    M2F_BATCH_SIZE = 4
+    M2F_ACCUM_STEPS = 4
+else: # 16GB+
+    # U-Net Effective 32
+    UNET_BATCH_SIZE = 32 
+    UNET_ACCUM_STEPS = 1
+    # M2F Effective 32
+    M2F_BATCH_SIZE = 8
+    M2F_ACCUM_STEPS = 2
 
 # %% [markdown]
 # ## Imports and deep learning resources
@@ -89,8 +114,8 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False # speedup for CNNs like U-Net.
+        torch.backends.cudnn.benchmark = True # speedup for CNNs like U-Net.
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 # %% [markdown]
@@ -99,9 +124,111 @@ def set_seed(seed=42):
 # @TAs: There is no need to review in detail these functions. The more interesting pipelines are further down.
 
 # %%
-# Create one or more functions to visualise 5 images on the validation set for each of the 4 models
+
+@torch.no_grad()
+def visualize_classification(model, loader, val_df, num_examples=6):
+    model.eval()
+    # 1. Grab exactly one batch from the loader
+    images, targets = next(iter(loader))
+    
+    # 2. Get predictions (using 0.5 threshold)
+    logits = model(images.to(device))
+    preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(int)
+    targets_np = targets.numpy().astype(int)
+
+    # 3. Plotting logic
+    cols = 3
+    rows = (num_examples + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 4.5 * rows))
+    axes = axes.flatten()
+
+    for i in range(num_examples):
+        # We take images from the batch, un-normalizing for display
+        img = np.clip(np.transpose(images[i].numpy() * 
+                     np.array([0.229, 0.224, 0.225]).reshape(3,1,1) + 
+                     np.array([0.485, 0.456, 0.406]).reshape(3,1,1), (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
+        
+        # Get labels using global 'labels' list
+        true_lbl = [labels[c] for c in range(len(labels)) if targets_np[i, c] == 1]
+        pred_lbl = [labels[c] for c in range(len(labels)) if preds[i, c] == 1]
+
+        axes[i].imshow(img)
+        axes[i].set_title(f"True: {', '.join(true_lbl)}\nPred: {', '.join(pred_lbl)}", fontsize=9)
+        axes[i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+def visualize_segmentation(model, val_loader, save_name, voc_classes, device='cuda', num_examples=5):
+    """
+    Standard visualization logic for semantic segmentation comparing Input, Ground Truth, and Prediction.
+    """
+    # 1. Load weights and set model to eval
+    model.load_state_dict(torch.load(f"{save_name}.pt", weights_only=True, map_location=device))
+    model.eval()
+    
+    # 2. Extract a single batch
+    images, masks = next(iter(val_loader))
+    
+    # Ensure we don't try to plot more images than exist in the batch
+    n = min(num_examples, images.size(0))
+    
+    # 3. Get predictions
+    with torch.no_grad():
+        outputs = model(images.to(device))
+        if hasattr(outputs, 'class_queries_logits'):
+            processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
+            target_sizes = [masks[i].shape for i in range(n)]
+            preds_list = processor.post_process_semantic_segmentation(outputs, target_sizes=target_sizes)
+            preds = torch.stack(preds_list).cpu().numpy()
+        else:
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
+        
+    images = images.numpy()
+    masks_np = masks.numpy()
+    
+    # Force padding/ignore index to background (0) for cleaner rendering
+    preds[masks_np == 255] = 0 
+    masks_np[masks_np == 255] = 0 
+    
+    # 4. Plotting setup
+    cmap = plt.get_cmap("nipy_spectral")
+    fig, axs = plt.subplots(n, 3, figsize=(15, 5 * n))
+    
+    # Handle matplotlib indexing when n=1 (1D array instead of 2D array)
+    if n == 1:
+        axs = np.expand_dims(axs, axis=0)
+        
+    for i in range(n):
+        # Un-normalize the image back to standard RGB
+        img = np.clip(np.transpose(images[i] * np.array([0.229, 0.224, 0.225]).reshape(3,1,1) + 
+                                   np.array([0.485, 0.456, 0.406]).reshape(3,1,1), (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
+        
+        axs[i, 0].imshow(img)
+        axs[i, 0].set_title("Input")
+        axs[i, 0].axis("off")
+        
+        axs[i, 1].imshow(masks_np[i], vmin=0, vmax=20, cmap="nipy_spectral")
+        axs[i, 1].set_title("Ground Truth")
+        axs[i, 1].axis("off")
+        
+        axs[i, 2].imshow(preds[i], vmin=0, vmax=20, cmap="nipy_spectral")
+        axs[i, 2].set_title(f"Prediction ({save_name})")
+        axs[i, 2].axis("off")
+        
+        # Build dynamic legend based on classes present in the prediction
+        legend_patches = [mpatches.Patch(color=cmap(c / 20.0), label=voc_classes[c]) for c in np.unique(preds[i])]
+        axs[i, 2].legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        
+    plt.tight_layout()
+    plt.show()
 
 # Create a function to clean-up VRAM after each model is run
+def clean_up_vram():
+    """Cleans up VRAM by collecting garbage and emptying the CUDA cache."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 # %% [markdown]
 # # 0. Data preprocessing
@@ -247,46 +374,97 @@ for v in sorted(counter.keys()):
     print(f"{v:>5} {name:<14} {counter[v]:>14,} {pct:>7.3f}%")
 
 # %% [markdown]
-# ### 0.2.4 Multi-label stratified train/validation split
+# ## 0.3 Multi-label stratified train/validation split
 
 # %%
-# Multi-label Stratified Split
-mskf = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-y_all = train_df[labels].values.astype(int)
-splits = list(mskf.split(np.zeros(len(y_all)), y_all))
-tr_idx, va_idx = splits[0] 
 
-# Train/Val Subsets
-train_indices, val_indices = sorted(tr_idx.tolist()), sorted(va_idx.tolist())
+# 1. Initialize the stratified splitter
+# We use 5 splits (which gives an 80% train / 20% val split)
+mskf = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# 2. Extract our target labels as a numpy array for the stratifier
+y_all = train_df[labels].values
+
+# 3. Generate the train and validation indices for the first fold
+# mskf.split expects (X, y). We can pass a dummy array for X of the same length as y.
+for tr_idx, va_idx in mskf.split(np.zeros(len(y_all)), y_all):
+    train_indices = tr_idx
+    val_indices = va_idx
+    break # We only need the first split for our train/val sets
+
+# 4. Create the specific classification dataframes the loader is looking for
 train_df_cls = train_df.iloc[train_indices].reset_index(drop=True)
-val_df_cls   = train_df.iloc[val_indices].reset_index(drop=True)
-print(f"Train subset : {len(train_indices)}  |  Val subset : {len(val_indices)}")
+val_df_cls = train_df.iloc[val_indices].reset_index(drop=True)
+
+print(f"Successfully created 'train_df_cls' with {len(train_df_cls)} samples.")
+print(f"Successfully created 'val_df_cls' with {len(val_df_cls)} samples.")
+
 
 # %% [markdown]
-# ## 0.3 Data Augmentation & DataLoaders
+# ## 0.4 Data Augmentation & DataLoaders
 # We centralize Datasets, Transforms, and Dataloaders here to ensure consistency and modularity across the 4 specific models. Transforms are specifically scaled dynamically according to model VRAM requirements and architectural needs.
 
 # %%
-IMG_MEAN, IMG_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-MEAN_C = (124, 116, 104)
-# REPLACE HARDCODER VALUES WITH DYNAMIC VALUES
+
+def calculate_dataset_stats(df):
+    """
+    Dynamically calculates the channel-wise mean and standard deviation 
+    of the entire dataset.
+    """
+    print("Calculating dynamic dataset statistics...")
+    
+    # 1. Stack all images into a single array to vectorize the calculation.
+    # We reshape to (-1, 3) to flatten all spatial dimensions, leaving just the color channels.
+    all_pixels = np.concatenate([img.reshape(-1, 3) for img in df["img"]], axis=0)
+    
+    # 2. Calculate the mean and std per channel (R, G, B)
+    # The output will be an array of shape (3,)
+    raw_mean = np.mean(all_pixels, axis=0)
+    raw_std = np.std(all_pixels, axis=0)
+    
+    # 3. Scale values for Albumentations Normalize (which expects values in [0, 1])
+    scaled_mean = raw_mean / 255.0
+    scaled_std = raw_std / 255.0
+    
+    # 4. Prepare the constant padding color (OpenCV expects integers)
+    pad_color = tuple(np.round(raw_mean).astype(int))
+    
+    print(f"Calculated Mean (scaled): {scaled_mean}")
+    print(f"Calculated Std (scaled):  {scaled_std}")
+    print(f"Calculated Pad Color:     {pad_color}")
+    
+    return tuple(scaled_mean), tuple(scaled_std), pad_color
+
+# Execute the calculation
+IMG_MEAN, IMG_STD, MEAN_C = calculate_dataset_stats(train_df)
 
 def get_transforms(model_name):
     """Returns dynamic transforms tailored to the specific model."""
+    
+    # 1. Determine which statistics to use based on the model type
+    if model_name in ["clip", "mask2former"]:
+        # Pre-trained models strictly require ImageNet statistics
+        active_mean, active_std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+    else:
+        # Models trained from scratch use your dynamically calculated dataset statistics
+        active_mean, active_std = IMG_MEAN, IMG_STD
+
+    # 2. Apply the chosen statistics (active_mean, active_std) to the transforms
     if model_name in ["smallcnn", "clip"]:
         crop_size = 224
         train_tf = A.Compose([
             A.RandomResizedCrop(size=(crop_size, crop_size), scale=(0.6, 1.0), ratio=(0.75, 1.3333)),
             A.HorizontalFlip(p=0.5),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
         val_tf = A.Compose([
             A.Resize(crop_size, crop_size),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
+        
     elif model_name == "unet":
         crop_size = 256
         train_tf = A.Compose([
@@ -296,17 +474,18 @@ def get_transforms(model_name):
             A.RandomCrop(height=crop_size, width=crop_size, p=1.0),
             A.HorizontalFlip(p=0.5),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.5),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
         val_tf = A.Compose([
             A.LongestMaxSize(max_size=crop_size, p=1.0),
             A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=cv2.BORDER_CONSTANT, fill=MEAN_C, fill_mask=255),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
+        
     elif model_name == "mask2former":
-        crop_size = 384
+        crop_size = 256
         train_tf = A.Compose([
             A.LongestMaxSize(max_size=int(crop_size * 1.5), p=1.0),
             A.RandomScale(scale_limit=(-0.2, 0.5), p=1.0), 
@@ -314,15 +493,16 @@ def get_transforms(model_name):
             A.RandomCrop(height=crop_size, width=crop_size),
             A.HorizontalFlip(p=0.5),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
         val_tf = A.Compose([
             A.LongestMaxSize(max_size=crop_size, p=1.0),
             A.PadIfNeeded(min_height=crop_size, min_width=crop_size, border_mode=cv2.BORDER_CONSTANT, fill=MEAN_C, fill_mask=255),
-            A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+            A.Normalize(mean=active_mean, std=active_std),
             ToTensorV2(),
         ])
+        
     return train_tf, val_tf
 
 # --- Dataset Classes ---
@@ -371,7 +551,7 @@ def get_dataloaders(model_name, task="classification", batch_size=16, num_worker
     return train_loader, val_loader
 
 # %% [markdown]
-# ## 0.4 Your Kaggle submission
+# ## 0.5 Your Kaggle submission
 # Transforms your test dataframe into a submission.csv file using Run-Length Encoding.
 
 # %%
@@ -432,6 +612,12 @@ test_df.loc[:, labels] = model.predict(test_df["img"])
 # ### 1.2.1 SmallCNN pipeline
 
 # %%
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from sklearn.metrics import average_precision_score
+
 class SmallCNN(nn.Module):
     def __init__(self, n_classes=20, in_ch=3):
         super().__init__()
@@ -456,7 +642,8 @@ class SmallCNN(nn.Module):
         return self.head(x)
 
 @torch.no_grad()
-def evaluate_cls(model, loader, loss_fn, device=device):
+def evaluate_cls(model, loader, loss_fn, device):
+    """Evaluates the classification model and calculates loss and mAP."""
     model.eval()
     losses, all_logits, all_targets = [], [], []
     for xb, yb in loader:
@@ -491,9 +678,10 @@ def tune_thresholds(val_logits, val_targets):
         best_thresholds[c], best_dices[c] = best_t, best_d
     return best_thresholds, best_dices
 
-def predict_cls(model, dataset, thresholds):
+def predict_cls(model, dataset, thresholds, device='cuda', batch_size=16, num_workers=0):
+    """Generates binary predictions using the classification model and tuned thresholds."""
     model.eval()
-    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     all_probs = []
     with torch.no_grad():
         for xb in loader:
@@ -501,7 +689,8 @@ def predict_cls(model, dataset, thresholds):
     all_probs = np.concatenate(all_probs)
     return (all_probs > thresholds).astype(np.int8), all_probs
 
-def train_cls(model, train_loader, val_loader, epochs, optimizer, scheduler, loss_fn, device=device):
+def train_scnn(model, train_loader, val_loader, epochs, optimizer, scheduler, loss_fn, device):
+    """Trains the SmallCNN model using mixed precision and tracks the best mAP."""
     scaler = torch.amp.GradScaler('cuda')
     best_mAP, best_state = -1.0, None
 
@@ -521,6 +710,7 @@ def train_cls(model, train_loader, val_loader, epochs, optimizer, scheduler, los
             epoch_losses.append(loss.item())
 
         scheduler.step()
+        
         val_loss, val_mAP, last_logits, last_targets = evaluate_cls(model, val_loader, loss_fn, device=device)
 
         if val_mAP > best_mAP:
@@ -535,36 +725,55 @@ def train_cls(model, train_loader, val_loader, epochs, optimizer, scheduler, los
 # ### 1.2.2 Execute pipeline: SmallCNN
 
 # %%
-# Dataloaders specifically tailored for smallcnn constraints
-train_loader_cls, val_loader_cls = get_dataloaders("smallcnn", task="classification")
+# 1. Dataloaders specifically tailored for SmallCNN constraints
+train_loader_scnn, val_loader_scnn = get_dataloaders("smallcnn", task="classification", batch_size=SCNN_BATCH_SIZE)
 
 EPOCHS_SMALLCNN = 50 if not SMOKE else 2
-bce_loss_cls = nn.BCEWithLogitsLoss(reduction="mean")
+bce_loss_scnn = nn.BCEWithLogitsLoss(reduction="mean")
 model_smallcnn = SmallCNN(n_classes=len(labels)).to(device)
 
 if TRAIN:
     set_seed()
+    # Optimizer and Scheduler remain focused on the SmallCNN parameters
     optimizer = torch.optim.AdamW(model_smallcnn.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_SMALLCNN)
-    best_state_smallcnn, val_logits_smallcnn, val_targets_smallcnn = train_cls(
-        model_smallcnn, train_loader_cls, val_loader_cls, epochs=EPOCHS_SMALLCNN, 
-        optimizer=optimizer, scheduler=scheduler, loss_fn=bce_loss_cls
+    
+    best_state_smallcnn, val_logits_smallcnn, val_targets_smallcnn = train_scnn(
+        model_smallcnn, 
+        train_loader_scnn, 
+        val_loader_scnn, 
+        epochs=EPOCHS_SMALLCNN, 
+        optimizer=optimizer, 
+        scheduler=scheduler, 
+        loss_fn=bce_loss_scnn,
+        device=device
     )
+    
     model_smallcnn.load_state_dict(best_state_smallcnn)
+    # Saving with a specific scnn filename
     torch.save(best_state_smallcnn, "cls_smallcnn_bce.pt")
 else:
+    # Loading logic for pre-trained weights
     if Path("cls_smallcnn_bce.pt").exists():
         model_smallcnn.load_state_dict(torch.load("cls_smallcnn_bce.pt", map_location=device))
-        _, _, val_logits_smallcnn, val_targets_smallcnn = evaluate_cls(model_smallcnn, val_loader_cls, bce_loss_cls)
+        
+        _, _, val_logits_smallcnn, val_targets_smallcnn = evaluate_cls(
+            model_smallcnn, 
+            val_loader_scnn, 
+            bce_loss_scnn,
+            device=device
+        )
 
+# 2. Post-training threshold tuning
 if 'val_logits_smallcnn' in locals():
     thresholds_smallcnn, dice_smallcnn = tune_thresholds(val_logits_smallcnn, val_targets_smallcnn)
     print(f"SmallCNN mean per-class Dice (val): {dice_smallcnn.mean():.4f}")
 
 # %%
-# call function to visualise 5 examples
+visualize_classification(model_smallcnn, val_loader_scnn, val_df_cls)
 
-# call function to clean VRAM
+clean_up_vram()
+
 
 # %% [markdown]
 # ## 1.3 Transfer learning: CLIP
@@ -645,10 +854,10 @@ def train_cls_clip(model, train_loader, val_loader, epochs, optimizer, scheduler
 
 # %%
 # CLIP specific transforms and loaders
-train_loader_clip, val_loader_clip = get_dataloaders("clip", task="classification")
+train_loader_clip, val_loader_clip = get_dataloaders("clip", task="classification", batch_size=SCNN_BATCH_SIZE)
 
-EPOCHS_CLIP, UNFREEZE_CLIP = (100, 30) if not SMOKE else (2, 1)
-
+EPOCHS_CLIP, UNFREEZE_CLIP = (75, 30) if not SMOKE else (2, 1)
+bce_loss_clip = nn.BCEWithLogitsLoss(reduction="mean")
 model_clip = CLIPMultiLabel(num_classes=len(labels), freeze_backbone=True).to(device)
 
 if TRAIN:
@@ -657,23 +866,24 @@ if TRAIN:
     sched_clip = torch.optim.lr_scheduler.CosineAnnealingLR(opt_clip, T_max=UNFREEZE_CLIP)
     best_state_clip, val_logits_clip, val_targets_clip = train_cls_clip(
         model_clip, train_loader_clip, val_loader_clip, epochs=EPOCHS_CLIP, 
-        optimizer=opt_clip, scheduler=sched_clip, loss_fn=bce_loss_cls, unfreeze_epoch=UNFREEZE_CLIP
+        optimizer=opt_clip, scheduler=sched_clip, loss_fn=bce_loss_clip, unfreeze_epoch=UNFREEZE_CLIP
     )
     model_clip.load_state_dict(best_state_clip)
     torch.save(best_state_clip, "clip_vitb16_multilabel.pt")
 else:
     if Path("clip_vitb16_multilabel.pt").exists():
         model_clip.load_state_dict(torch.load("clip_vitb16_multilabel.pt", map_location=device))
-        _, _, val_logits_clip, val_targets_clip = evaluate_cls(model_clip, val_loader_clip, bce_loss_cls)
+        _, _, val_logits_clip, val_targets_clip = evaluate_cls(model_clip, val_loader_clip, bce_loss_clip)
 
 if 'val_logits_clip' in locals():
     thresholds_clip, dice_clip = tune_thresholds(val_logits_clip, val_targets_clip)
     print(f"CLIP ViT-B/16 mean Dice: {dice_clip.mean():.4f}")
 
 # %%
-# call function to visualise 5 examples
+visualize_classification(model_clip, val_loader_clip, val_df_cls)
 
-# call function to clean VRAM
+clean_up_vram()
+
 
 # %% [markdown]
 # ### 1.3.2 CLIP predictions for submission
@@ -693,7 +903,7 @@ class VOCClassificationDatasetTest(Dataset):
 if 'thresholds_clip' in locals():
     _, cls_val_tf = get_transforms("clip")
     test_ds_cls = VOCClassificationDatasetTest(test_df, transform=cls_val_tf)
-    preds_test, probs_test = predict_cls(model_clip, test_ds_cls, thresholds_clip)
+    preds_test, probs_test = predict_cls(model_clip, test_ds_cls, thresholds_clip, batch_size=CLIP_BATCH_SIZE, num_workers=NUM_WORKERS)
     test_df.loc[:, labels] = preds_test
     print(f"Filled test_df with CLIP predictions. Shape: {preds_test.shape}")
 
@@ -701,6 +911,67 @@ if 'thresholds_clip' in locals():
 # # 2. Semantic segmentation
 #
 # The goal here is to implement a segmentation model that labels every pixel in the image as belonging to one of the 20 classes (and/or background). Use the training set to train your model and compete on the test set (by filling in the segmentation column in the test dataframe).
+
+# %%
+# Generic utilities for semantic segmentation tasks
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes=21, smooth=1.0):
+        super().__init__()
+        self.num_classes, self.smooth = num_classes, smooth
+
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=1)
+        targets_oh = F.one_hot(targets.clamp(0, 20), self.num_classes).permute(0, 3, 1, 2).float()
+        
+        # Mask out ignore index
+        mask = (targets != 255).unsqueeze(1).float()
+        probs, targets_oh = probs * mask, targets_oh * mask
+
+        dims = (0, 2, 3)
+        inter = (probs * targets_oh).sum(dims)
+        dice = (2 * inter + self.smooth) / (probs.sum(dims) + targets_oh.sum(dims) + self.smooth)
+
+        present = targets_oh.sum(dims) > 0 
+        dice, present = dice[1:], present[1:] # ignore background
+        return 1.0 - dice[present].mean() if present.any() else logits.sum() * 0.0 
+
+class CEDiceLoss(nn.Module):
+    def __init__(self, ce_weight=1.0, dice_weight=1.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(ignore_index=255)
+        self.dice = DiceLoss()
+        self.ce_w, self.dc_w = ce_weight, dice_weight
+
+    def forward(self, logits, targets):
+        return self.ce_w * self.ce(logits, targets) + self.dc_w * self.dice(logits, targets)
+
+class SegmentationMetrics:
+    def __init__(self, num_classes=21):
+        self.num_classes = num_classes
+        self.reset()
+    def reset(self):
+        self.confusion = torch.zeros(self.num_classes, self.num_classes, dtype=torch.long)
+    @torch.no_grad()
+    def update(self, logits, targets):
+        preds = logits.argmax(dim=1)
+        self.update_preds(preds, targets)
+        
+    @torch.no_grad()
+    def update_preds(self, preds, targets):
+        preds = preds.flatten().cpu()
+        targets = targets.flatten().cpu()
+        valid = targets != 255
+        idx = targets[valid] * self.num_classes + preds[valid]
+        self.confusion += torch.bincount(idx, minlength=self.num_classes ** 2).reshape(self.num_classes, self.num_classes)
+    def compute(self):
+        cm = self.confusion.float()
+        tp = cm.diagonal()
+        fn, fp = cm.sum(dim=1) - tp, cm.sum(dim=0) - tp
+        dice_per_class = (2 * tp + 1e-7) / (2 * tp + fp + fn + 1e-7)
+        actual_present = (cm.sum(dim=1) > 0)
+        mean_dice = dice_per_class[1:][actual_present[1:]].mean().item() if actual_present[1:].any() else 0.0
+        return {"per_class_dice": dice_per_class.tolist(), "mean_dice": mean_dice}
+
 
 # %% [markdown]
 # ## 2.1 Benchmark: Random segmentation
@@ -752,6 +1023,7 @@ class Up(nn.Module):
         self.conv = DoubleConv(in_channels // 2 + skip_channels, out_channels)
     def forward(self, x, skip): return self.conv(torch.cat([skip, self.up(x)], dim=1))
     
+    
 class UNet(nn.Module):
     def __init__(self, in_channels=3, num_classes=21, base_channels=32):
         super().__init__()
@@ -775,59 +1047,6 @@ class UNet(nn.Module):
         d2 = self.dec2(d3, s2)
         d1 = self.dec1(d2, s1)
         return self.head(d1)
-
-class DiceLoss(nn.Module):
-    def __init__(self, num_classes=21, smooth=1.0):
-        super().__init__()
-        self.num_classes, self.smooth = num_classes, smooth
-
-    def forward(self, logits, targets):
-        probs = F.softmax(logits, dim=1)
-        targets_oh = F.one_hot(targets.clamp(0, 20), self.num_classes).permute(0, 3, 1, 2).float()
-        
-        # Mask out ignore index
-        mask = (targets != 255).unsqueeze(1).float()
-        probs, targets_oh = probs * mask, targets_oh * mask
-
-        dims = (0, 2, 3)
-        inter = (probs * targets_oh).sum(dims)
-        dice = (2 * inter + self.smooth) / (probs.sum(dims) + targets_oh.sum(dims) + self.smooth)
-
-        present = targets_oh.sum(dims) > 0 
-        dice, present = dice[1:], present[1:] # ignore background
-        return 1.0 - dice[present].mean() if present.any() else logits.sum() * 0.0 
-
-class CEDiceLoss(nn.Module):
-    def __init__(self, ce_weight=1.0, dice_weight=1.0):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(ignore_index=255)
-        self.dice = DiceLoss()
-        self.ce_w, self.dc_w = ce_weight, dice_weight
-
-    def forward(self, logits, targets):
-        return self.ce_w * self.ce(logits, targets) + self.dc_w * self.dice(logits, targets)
-
-class SegmentationMetrics:
-    def __init__(self, num_classes=21):
-        self.num_classes = num_classes
-        self.reset()
-    def reset(self):
-        self.confusion = torch.zeros(self.num_classes, self.num_classes, dtype=torch.long)
-    @torch.no_grad()
-    def update(self, logits, targets):
-        preds = logits.argmax(dim=1).flatten().cpu()
-        targets = targets.flatten().cpu()
-        valid = targets != 255
-        idx = targets[valid] * self.num_classes + preds[valid]
-        self.confusion += torch.bincount(idx, minlength=self.num_classes ** 2).reshape(self.num_classes, self.num_classes)
-    def compute(self):
-        cm = self.confusion.float()
-        tp = cm.diagonal()
-        fn, fp = cm.sum(dim=1) - tp, cm.sum(dim=0) - tp
-        dice_per_class = (2 * tp + 1e-7) / (2 * tp + fp + fn + 1e-7)
-        actual_present = (cm.sum(dim=1) > 0)
-        mean_dice = dice_per_class[1:][actual_present[1:]].mean().item() if actual_present[1:].any() else 0.0
-        return {"per_class_dice": dice_per_class.tolist(), "mean_dice": mean_dice}
     
 
 @torch.no_grad()
@@ -858,26 +1077,30 @@ def validate_unet(model, df, indices, loss_fn, multiple=16):
 
     return running_loss / n, metrics.compute()
 
+
 # %% [markdown]
 # ### 2.2.2 Execute pipeline: U-Net
 
 # %%
-train_loader_unet, val_loader_unet = get_dataloaders("unet", task="segmentation", batch_size=16)
+train_loader_unet, val_loader_unet = get_dataloaders("unet", task="segmentation", batch_size=UNET_BATCH_SIZE)
 
 model_unet = UNet(in_channels=3, num_classes=21, base_channels=64).to(device)
 loss_fn = CEDiceLoss(ce_weight=1.0, dice_weight=5.0)
 
+# Update below the number of epochs to limit training time.
+# As a reference, the model achieves Dice = 0.2 only after 250 epochs.
 if TRAIN:
-    NUM_EPOCHS = 250 if not SMOKE else 2
+    NUM_EPOCHS = 20 if not SMOKE else 2 
     optimizer = torch.optim.Adam(model_unet.parameters(), lr=3e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = torch.amp.GradScaler('cuda')
     best_val_dice = -1.0
-    accumulation_steps = 2
+    accumulation_steps = UNET_ACCUM_STEPS
     
     for epoch in range(1, NUM_EPOCHS + 1):
         model_unet.train()
         optimizer.zero_grad(set_to_none=True)
+        epoch_losses = []
         for i, (images, masks) in enumerate(train_loader_unet):
             images, masks = images.to(device), masks.to(device)
             
@@ -890,29 +1113,35 @@ if TRAIN:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+            
+            epoch_losses.append((loss * accumulation_steps).item())
         scheduler.step()
         
         if epoch % 5 == 0:
             val_loss, val_result = validate_unet(model_unet, train_df, val_indices, loss_fn)
             if val_result['mean_dice'] > best_val_dice:
                 best_val_dice = val_result['mean_dice']
-                torch.save(model_unet.state_dict(), "final_unet.pth")
-            print(f"U-Net Epoch {epoch}/{NUM_EPOCHS} | Val Dice: {val_result['mean_dice']:.4f}")
+                torch.save(model_unet.state_dict(), "final_unet.pt")
+            print(f"U-Net Epoch {epoch:3d}/{NUM_EPOCHS} | train loss {np.mean(epoch_losses):.4f} | val loss {val_loss:.4f} | Val Dice: {val_result['mean_dice']:.4f}")
             
 else:
-    if Path("final_unet.pth").exists():
-        model_unet.load_state_dict(torch.load("final_unet.pth", map_location=device))
+    if Path("final_unet.pt").exists():
+        model_unet.load_state_dict(torch.load("final_unet.pt", map_location=device))
         val_loss, val_result = validate_unet(model_unet, train_df, val_indices, loss_fn)
         print(f"U-Net Loaded Val Dice: {val_result['mean_dice']:.4f}")
 
 # %%
-# call function to visualise 5 examples
+visualize_segmentation(model_unet, val_loader_unet, save_name="final_unet", voc_classes=VOC_CLASSES)
 
-# call function to clean VRAM
+clean_up_vram()
+
 
 # %% [markdown]
 # ## 2.3 Transfer learning: Mask2Former
 # **Architecture:** Utilizes Set Prediction and Bipartite (Hungarian) Matching, processing masks globally rather than relying solely on pixel-by-pixel cross-entropy.
+
+# %% [markdown]
+# ### 2.3.1 Mask2Former Pipeline (Bipartite Matching)
 
 # %%
 def prepare_mask2former_targets(masks_tensor, ignore_index=255):
@@ -935,13 +1164,35 @@ def prepare_mask2former_targets(masks_tensor, ignore_index=255):
         class_labels.append(torch.stack(b_classes).to(torch.int64))
     return mask_labels, class_labels
 
+@torch.no_grad()
+def evaluate_m2f(model, val_loader, device):
+    model.eval()
+    losses = []
+    processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
+    metrics = SegmentationMetrics(num_classes=21)
+    
+    for images, masks in val_loader:
+        images, masks = images.to(device), masks.to(device)
+        mask_labels, class_labels = prepare_mask2former_targets(masks)
+        
+        with torch.amp.autocast('cuda'):
+            outputs = model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
+            loss = outputs.loss
+        losses.append(loss.item())
+        
+        target_sizes = [mask.shape for mask in masks]
+        preds_list = processor.post_process_semantic_segmentation(outputs, target_sizes=target_sizes)
+        preds = torch.stack(preds_list)
+        
+        metrics.update_preds(preds, masks)
+
+    return np.mean(losses), metrics.compute()
+
 # %% [markdown]
-# ### 2.3.1 Execute pipeline: Mask2Former
+# ### 2.3.2 Execute pipeline: Mask2Former
 
 # %%
-torch.cuda.empty_cache(); gc.collect()
-
-train_loader_m2f, val_loader_m2f = get_dataloaders("mask2former", task="segmentation", batch_size=2)
+train_loader_m2f, val_loader_m2f = get_dataloaders("mask2former", task="segmentation", batch_size=M2F_BATCH_SIZE, num_workers=NUM_WORKERS)
 
 config = Mask2FormerConfig.from_pretrained("facebook/mask2former-swin-tiny-ade-semantic")
 config.num_queries = 100
@@ -951,7 +1202,7 @@ hf_m2f = Mask2FormerForUniversalSegmentation.from_pretrained(
     "facebook/mask2former-swin-tiny-ade-semantic", config=config, ignore_mismatched_sizes=True).to(device)
 
 if TRAIN:
-    M2F_EPOCHS = 40 if not SMOKE else 2
+    M2F_EPOCHS = 30 if not SMOKE else 2
     base_lr = 1e-4
     optimizer_m2f = torch.optim.AdamW([
         {'params': hf_m2f.model.pixel_level_module.encoder.parameters(), 'lr': base_lr * 0.1},
@@ -960,30 +1211,46 @@ if TRAIN:
     ], weight_decay=1e-4)
 
     scaler = torch.amp.GradScaler('cuda')
+    best_m2f_dice = -1.0
     
     for epoch in range(1, M2F_EPOCHS + 1):
         hf_m2f.train()
+        epoch_losses = []
+        optimizer_m2f.zero_grad(set_to_none=True)
         for i, (images, masks) in enumerate(train_loader_m2f):
             images, masks = images.to(device), masks.to(device)
             mask_labels, class_labels = prepare_mask2former_targets(masks)
             
-            optimizer_m2f.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda'):
                 outputs = hf_m2f(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels)
-                loss = outputs.loss
+                loss = outputs.loss / M2F_ACCUM_STEPS
             scaler.scale(loss).backward()
-            scaler.step(optimizer_m2f)
-            scaler.update()
-        print(f"Mask2Former Epoch {epoch}/{M2F_EPOCHS} completed.")
-    torch.save(hf_m2f.state_dict(), "best_mask2former.pt")
+            
+            if (i + 1) % M2F_ACCUM_STEPS == 0 or (i + 1) == len(train_loader_m2f):
+                scaler.step(optimizer_m2f)
+                scaler.update()
+                optimizer_m2f.zero_grad(set_to_none=True)
+                
+            epoch_losses.append((loss * M2F_ACCUM_STEPS).item())
+            
+        if epoch % 5 == 0:
+            val_loss, val_result = evaluate_m2f(hf_m2f, val_loader_m2f, device)
+            if val_result['mean_dice'] > best_m2f_dice:
+                best_m2f_dice = val_result['mean_dice']
+                torch.save(hf_m2f.state_dict(), "best_mask2former.pt")
+            print(f"Mask2Former Epoch {epoch:3d}/{M2F_EPOCHS} | train loss {np.mean(epoch_losses):.4f} | val loss {val_loss:.4f} | Val Dice: {val_result['mean_dice']:.4f}")
+            
+    if not Path("best_mask2former.pt").exists():
+        torch.save(hf_m2f.state_dict(), "best_mask2former.pt")
 else:
     if Path("best_mask2former.pt").exists():
         hf_m2f.load_state_dict(torch.load("best_mask2former.pt", map_location=device))
 
 # %%
-# call function to visualise 5 examples
+visualize_segmentation(hf_m2f, val_loader_m2f, save_name="best_mask2former", voc_classes=VOC_CLASSES)
 
-# call function to clean VRAM
+clean_up_vram()
+
 
 # %% [markdown]
 # # 3. Submitting best results
