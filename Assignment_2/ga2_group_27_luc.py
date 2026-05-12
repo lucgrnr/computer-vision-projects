@@ -1,13 +1,14 @@
 # ---
 # jupyter:
 #   jupytext:
+#     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
 #       jupytext_version: 1.19.1
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: .venv (3.12.3)
 #     language: python
 #     name: python3
 # ---
@@ -75,8 +76,10 @@ from transformers import (
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Training on device: {device}")
 
-# Base Kaggle Directory
-DATA_PATH = '/kaggle/input/kul-computer-vision-ga-2-2025'
+
+# Base Directory
+DATA_PATH = ''
+#DATA_PATH = '/kaggle/input/kul-computer-vision-ga-2-2026'
 
 VOC_CLASSES = [
     "background", "aeroplane", "bicycle", "bird", "boat", "bottle",
@@ -117,6 +120,25 @@ test_df = pd.read_csv(os.path.join(test_dir, "test_set.csv"), index_col="Id")
 test_df["img"] = [np.load(os.path.join(test_dir, "img", f"test_{idx}.npy")) for idx, _ in test_df.iterrows()]
 test_df["seg"] = [-1 * np.ones(img.shape[:2], dtype=np.int8) for img in test_df["img"]]
 print("The test set contains {} examples.".format(len(test_df)))
+
+# Show some examples
+fig, axs = plt.subplots(2, 20, figsize=(10 * 20, 10 * 2))
+for i in range(20):
+    row = test_df.iloc[i]
+    
+    # Plot Image
+    axs[0, i].imshow(row["img"], vmin=0, vmax=255)
+    axs[0, i].set_title(f"Test Image {i}", fontsize=40)
+    axs[0, i].axis("off")
+    
+    # Plot Segmentation Placeholder
+    axs[1, i].imshow(row["seg"], vmin=0, vmax=20) 
+    axs[1, i].axis("off")
+    
+plt.show()
+
+# The test dataframe is similar to the training dataframe, but here the values are -1 --> your task is to fill in these as good as possible in Sect. 2 and Sect. 3; in Sect. 6 this dataframe is automatically transformed in the submission CSV!
+test_df.head(1)
 
 # %% [markdown]
 # ## Your Kaggle submission
@@ -168,6 +190,64 @@ test_df.loc[:, labels] = model.predict(test_df["img"])
 # %% [markdown]
 # # 2. Semantic segmentation
 # The goal here is to implement a segmentation model that labels every pixel in the image as belonging to one of the 20 classes (and/or background). 
+#
+# We test the performance of 3 models:
+#
+# ---
+#
+# 1. DeepLabV3+
+#
+# **Description:**  
+# DeepLabV3+ is a high-performance CNN-based architecture that builds upon the concept of spatial pyramid pooling. It is designed to capture multi-scale context by using filters at multiple sampling rates. It is widely considered the "gold standard" for traditional deep learning segmentation due to its balance of boundary sharpness and category accuracy.
+#
+# **Key Components:**
+# *   **Atrous Convolution:** Uses "dilated" filters to expand the receptive field without increasing the number of parameters.
+# *   **ASPP (Atrous Spatial Pyramid Pooling):** Probes the incoming feature map with filters at multiple rates to capture objects at various scales.
+# *   **Encoder-Decoder Structure:** A simple yet effective decoder refines object boundaries by gradually recovering spatial information.
+#
+# ---
+#
+# 2. SegFormer
+#
+# **Description:**  
+# SegFormer is a "Transformer-only" framework that defies the traditional need for complex decoders or positional encoding. It is highly efficient and remarkably robust to different input resolutions. Unlike earlier Vision Transformers (ViT), SegFormer is designed specifically for dense prediction tasks like segmentation.
+#
+# **Key Components:**
+# *   **Hierarchical Transformer Encoder:** Produces multi-scale features (high-resolution coarse features and low-resolution fine features) similar to a CNN, but using self-attention.
+# *   **Positional-Encoding-Free:** Uses overlapping patch embeddings and convolutions to provide positional information, allowing the model to perform well on resolutions it wasn't trained on.
+# *   **Lightweight MLP Decoder:** Because the encoder captures powerful global context, the decoder only needs a simple Multi-Layer Perceptron to aggregate information.
+#
+# ---
+#
+# 3. Mask2Former
+#
+# **Description:**  
+# Mask2Former is a revolutionary "Universal" segmentation model. While the other two models predict a class for every pixel, Mask2Former treats segmentation as a **mask classification** problem. It identifies a set of regions (masks) and then assigns a label to each region. This allows a single architecture to handle semantic, instance, and panoptic segmentation.
+#
+# **Key Components:**
+# *   **Pixel Decoder:** A convolutional branch that enhances image features to a high resolution.
+# *   **Transformer Decoder:** Uses a set of "Object Queries" (learnable vectors) that interact with image features to "search" for objects.
+# *   **Masked Attention:** Constrains the attention mechanism to the predicted mask area, leading to faster convergence and better detail.
+#
+# ---
+#
+# Architectural Comparison
+#
+# | Feature | DeepLabV3+ | SegFormer | Mask2Former |
+# | :--- | :--- | :--- | :--- |
+# | **Core Paradigm** | Convolutional (CNN) | Transformer (Self-Attention) | Query-based (Set Prediction) |
+# | **Backbone Type** | EfficientNet, ResNet, etc. | MiT (Mix Transformer) | Swin, ResNet, etc. |
+# | **Context Extraction** | Dilated Convolutions (ASPP) | Global Self-Attention | Object Queries & Masked Attention |
+# | **Loss Logic** | Pixel-wise Cross Entropy | Pixel-wise Cross Entropy | Hungarian Matching (Set Loss) |
+# | **Output Type** | Per-pixel class probability | Per-pixel class probability | A set of Binary Masks + Labels |
+# | **Resolution Support**| Best at trained resolution | Highly flexible / Scale invariant | Best at high resolutions |
+#
+# ---
+#
+# Structural Summary
+# *   **DeepLabV3+** is **local-to-global**: It uses small kernels to build up a global understanding. 
+# *   **SegFormer** is **inherently global**: Every pixel can "talk" to every other pixel from the first layer, making it better at understanding the relationship between distant objects.
+# *   **Mask2Former** is **object-centric**: Instead of asking "What class is this pixel?", it asks "Where is an object, and what is its shape?", which allows it to excel at distinguishing overlapping instances.
 
 # %% [markdown]
 # ## 2.1 Train / Validation Split
@@ -274,13 +354,13 @@ class SegFormerWrapper(nn.Module):
         return F.interpolate(outputs, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
 def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, save_name, target_effective_batch=16):
-    """Standard training loop with Automatic Gradient Accumulation."""
+    """Standard training loop with Automatic Gradient Accumulation and Loss Plotting."""
     physical_batch = train_loader.batch_size
     accumulation_steps = max(1, target_effective_batch // physical_batch)
     
     scaler = torch.amp.GradScaler('cuda')
     best_val_loss = float("inf")
-    train_losses, val_losses = [], []
+    train_losses, val_losses = [], [] # --- Tracking Lists ---
 
     print(f"--- Starting Training for {save_name} ---")
     
@@ -319,6 +399,8 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, s
                 val_loss += loss.item() * images.size(0)
                 
         val_loss /= len(val_loader.dataset)
+        
+        # --- Store losses for plotting ---
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         
@@ -327,10 +409,20 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, s
             best_val_loss = val_loss
             torch.save(model.state_dict(), f"{save_name}.pt")
             
+    plt.figure(figsize=(10, 4))
+    plt.plot(range(1, epochs + 1), train_losses, label='Training Loss', color='blue')
+    plt.plot(range(1, epochs + 1), val_losses, label='Validation Loss', color='red', linestyle='--')
+    plt.title(f'Loss Curve: {save_name}')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.show()
+    
     return train_losses, val_losses
 
 def evaluate_metrics(model, val_loader, save_name, num_classes=21):
-    """Calculates Detailed Per-Class Metrics."""
+    """Calculates Detailed Per-Class and Global Metrics."""
     model.load_state_dict(torch.load(f"{save_name}.pt", weights_only=True))
     model.eval()
     conf_matrix = torch.zeros(num_classes, num_classes, dtype=torch.int64)
@@ -360,10 +452,19 @@ def evaluate_metrics(model, val_loader, save_name, num_classes=21):
     for i, name in enumerate(VOC_CLASSES):
         print(f"{i:<3} {name:<15} IoU: {iou[i]:.4f} | Dice: {dice[i]:.4f}")
 
-    print(f"\nMean Foreground Dice:   {np.mean(dice[1:]):.4f}\n")
+    mean_iou = np.mean(iou)
+    mean_dice_all = np.mean(dice)
+    mean_dice_foreground = np.mean(dice[1:])
+
+    print("-" * 47)
+    print(f"Mean IoU (All):         {mean_iou:.4f}")
+    print(f"Mean Dice (All):        {mean_dice_all:.4f}")
+    print(f"Mean Foreground Dice:   {mean_dice_foreground:.4f}  <-- Key Metric\n")
+    
+    return mean_iou, mean_dice_foreground
 
 def visualize_predictions(model, val_loader, save_name, num_examples=4):
-    """Standard Visualization logic."""
+    """Standard Visualization logic with Legend."""
     model.load_state_dict(torch.load(f"{save_name}.pt", weights_only=True))
     model.eval()
     
@@ -373,10 +474,7 @@ def visualize_predictions(model, val_loader, save_name, num_examples=4):
         
     images = images.numpy()
     masks_np = masks.numpy()
-    
-    # Force predictions in the padded areas to be 0 (Background)
-    preds[masks_np == 255] = 0 
-    
+    preds[masks_np == 255] = 0 # Force padding predictions to background
     masks_np[masks_np == 255] = 0 # Map 255 back to 0 for rendering
     
     cmap = plt.get_cmap("nipy_spectral")
@@ -386,7 +484,11 @@ def visualize_predictions(model, val_loader, save_name, num_examples=4):
                                    np.array([0.485, 0.456, 0.406]).reshape(3,1,1), (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
         axs[i, 0].imshow(img); axs[i, 0].set_title("Input"); axs[i, 0].axis("off")
         axs[i, 1].imshow(masks_np[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 1].set_title("Ground Truth"); axs[i, 1].axis("off")
-        axs[i, 2].imshow(preds[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 2].set_title("Prediction"); axs[i, 2].axis("off")
+        axs[i, 2].imshow(preds[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 2].set_title(f"Prediction ({save_name})"); axs[i, 2].axis("off")
+        
+        legend_patches = [mpatches.Patch(color=cmap(c / 20.0), label=VOC_CLASSES[c]) for c in np.unique(preds[i])]
+        axs[i, 2].legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        
     plt.tight_layout()
     plt.show()
 
@@ -401,11 +503,17 @@ model_deeplab = smp.DeepLabV3Plus(encoder_name="tu-tf_efficientnetv2_s", encoder
 optimizer_dl = torch.optim.AdamW(model_deeplab.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler_dl = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_dl, T_max=40)
 
-train_model(model_deeplab, train_loader, val_loader, optimizer_dl, scheduler_dl, epochs=40, save_name="best_deeplab")
+train_hist, val_hist = train_model(model_deeplab, train_loader, val_loader, optimizer_dl, scheduler_dl, epochs=40, save_name="best_deeplab")
+
+# %%
 evaluate_metrics(model_deeplab, val_loader, save_name="best_deeplab")
+
+# %%
 visualize_predictions(model_deeplab, val_loader, save_name="best_deeplab")
 
+# %%
 del model_deeplab, optimizer_dl, train_loader, val_loader # Free VRAM
+torch.cuda.empty_cache(); gc.collect()
 
 # %% [markdown]
 # ## 2.3.2 Execute Pipeline: SegFormer-B2
@@ -418,11 +526,20 @@ hf_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/mit-b2", num
 model_segformer = SegFormerWrapper(hf_model).to(device)
 
 optimizer_sf = torch.optim.AdamW(model_segformer.parameters(), lr=1e-4, weight_decay=1e-4)
-scheduler_sf = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_sf, T_max=20)
+scheduler_sf = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_sf, T_max=12)
 
-train_model(model_segformer, train_loader, val_loader, optimizer_sf, scheduler_sf, epochs=20, save_name="best_segformer")
+train_hist, val_hist = train_model(model_segformer, train_loader, val_loader, optimizer_sf, scheduler_sf, epochs=12, save_name="best_segformer")
+
+# %%
 evaluate_metrics(model_segformer, val_loader, save_name="best_segformer")
+
+# %%
 visualize_predictions(model_segformer, val_loader, save_name="best_segformer")
+
+# %%
+del model_segformer, optimizer_sf, train_loader, val_loader # Free VRAM
+torch.cuda.empty_cache(); gc.collect()
+
 
 # %% [markdown]
 # ## 2.4 Native Mask2Former Pipeline (Bipartite Matching)
@@ -453,6 +570,7 @@ def train_mask2former_native(model, train_loader, val_loader, optimizer, schedul
     accumulation_steps = max(1, target_effective_batch // train_loader.batch_size)
     scaler = torch.amp.GradScaler('cuda')
     best_val_loss = float("inf")
+    train_losses, val_losses = [], [] # --- Tracking Lists ---
     
     print(f"--- Starting Native Mask2Former Training ---")
     for epoch in range(epochs):
@@ -491,13 +609,31 @@ def train_mask2former_native(model, train_loader, val_loader, optimizer, schedul
                     val_loss += model(pixel_values=images, mask_labels=mask_labels, class_labels=class_labels).loss.item() * images.size(0)
                 
         val_loss /= len(val_loader.dataset)
+        
+        # --- Store losses for plotting ---
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
         print(f"Epoch {epoch+1:02d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), f"{save_name}.pt")
 
+    plt.figure(figsize=(10, 4))
+    plt.plot(range(1, epochs + 1), train_losses, label='Training Loss', color='blue')
+    plt.plot(range(1, epochs + 1), val_losses, label='Validation Loss', color='red', linestyle='--')
+    plt.title(f'Loss Curve: {save_name}')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.show()
+    
+    return train_losses, val_losses
+
 def evaluate_mask2former_native(model, val_loader, save_name, num_classes=21):
+    """Native Mask2Former Evaluation with Detailed Metrics."""
     model.load_state_dict(torch.load(f"{save_name}.pt", weights_only=True))
     model.eval()
     processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
@@ -522,36 +658,64 @@ def evaluate_mask2former_native(model, val_loader, save_name, num_classes=21):
     fp = conf_matrix.sum(dim=0) - tp
     fn = conf_matrix.sum(dim=1) - tp
     
+    iou = (tp.float() / (tp + fp + fn + 1e-12)).numpy()
     dice = ((2. * tp.float()) / (2. * tp + fp + fn + 1e-12)).numpy()
-    print(f"\nMean Foreground Dice: {np.mean(dice[1:]):.4f}\n")
+    
+    print(f"\n--- Evaluation Results: {save_name} ---")
+    for i, name in enumerate(VOC_CLASSES):
+        print(f"{i:<3} {name:<15} IoU: {iou[i]:.4f} | Dice: {dice[i]:.4f}")
+
+    mean_iou = np.mean(iou)
+    mean_dice_all = np.mean(dice)
+    mean_dice_foreground = np.mean(dice[1:])
+
+    print("-" * 47)
+    print(f"Mean IoU (All):         {mean_iou:.4f}")
+    print(f"Mean Dice (All):        {mean_dice_all:.4f}")
+    print(f"Mean Foreground Dice:   {mean_dice_foreground:.4f}  <-- Key Metric\n")
+    
+    return mean_iou, mean_dice_foreground
 
 def visualize_mask2former_native(model, val_loader, save_name, num_examples=4):
-    """Custom Visualizer for Mask2Former Query Decoding"""
+    """Custom Visualizer for Mask2Former with dynamic batch size handling"""
     model.load_state_dict(torch.load(f"{save_name}.pt", weights_only=True))
     model.eval()
     processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
     
     images, masks = next(iter(val_loader))
+    
+    # Adjust num_examples to not exceed the actual batch size
+    actual_batch_size = images.shape[0]
+    num_to_show = min(num_examples, actual_batch_size)
+    
     with torch.no_grad():
         outputs = model(pixel_values=images.to(device))
         target_sizes = [masks.shape[1:] for _ in range(images.shape[0])]
         preds = torch.stack(processor.post_process_semantic_segmentation(outputs, target_sizes=target_sizes)).cpu().numpy()
         
     images, masks_np = images.numpy(), masks.numpy()
-    
-    # Force predictions in the padded areas to be 0 (Background)
     preds[masks_np == 255] = 0 
-    
-    masks_np[masks_np == 255] = 0 # Map 255 back to 0 for rendering
+    masks_np[masks_np == 255] = 0 
     
     cmap = plt.get_cmap("nipy_spectral")
-    fig, axs = plt.subplots(num_examples, 3, figsize=(15, 5 * num_examples))
-    for i in range(num_examples):
+    
+    # Create the plot based on num_to_show
+    fig, axs = plt.subplots(num_to_show, 3, figsize=(15, 5 * num_to_show))
+    
+    # Handle the case where num_to_show is 1 (Matplotlib removes the first axis dimension)
+    if num_to_show == 1:
+        axs = np.expand_dims(axs, axis=0)
+
+    for i in range(num_to_show):
         img = np.clip(np.transpose(images[i] * np.array([0.229, 0.224, 0.225]).reshape(3,1,1) + 
                                    np.array([0.485, 0.456, 0.406]).reshape(3,1,1), (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
-        axs[i, 0].imshow(img); axs[i, 0].axis("off")
-        axs[i, 1].imshow(masks_np[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 1].axis("off")
-        axs[i, 2].imshow(preds[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 2].axis("off")
+        axs[i, 0].imshow(img); axs[i, 0].axis("off"); axs[i, 0].set_title("Input")
+        axs[i, 1].imshow(masks_np[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 1].axis("off"); axs[i, 1].set_title("Ground Truth")
+        axs[i, 2].imshow(preds[i], vmin=0, vmax=20, cmap="nipy_spectral"); axs[i, 2].axis("off"); axs[i, 2].set_title(f"Prediction ({save_name})")
+        
+        legend_patches = [mpatches.Patch(color=cmap(c / 20.0), label=VOC_CLASSES[c]) for c in np.unique(preds[i])]
+        axs[i, 2].legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        
     plt.show()
 
 # %% [markdown]
@@ -576,14 +740,22 @@ optimizer_m2f = torch.optim.AdamW([
     {'params': hf_m2f.class_predictor.parameters(), 'lr': base_lr},
 ], weight_decay=1e-4)
 
-scheduler_m2f = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_m2f, T_max=30)
+scheduler_m2f = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_m2f, T_max=12)
 
-train_mask2former_native(hf_m2f, train_loader, val_loader, optimizer_m2f, scheduler_m2f, epochs=30, save_name="native_mask2former")
+train_hist, val_hist = train_mask2former_native(hf_m2f, train_loader, val_loader, optimizer_m2f, scheduler_m2f, epochs=12, save_name="native_mask2former")
+
+# %%
 evaluate_mask2former_native(hf_m2f, val_loader, save_name="native_mask2former")
+
+# %%
 visualize_mask2former_native(hf_m2f, val_loader, save_name="native_mask2former")
 
+# %%
 del hf_m2f, optimizer_m2f, train_loader, val_loader
 torch.cuda.empty_cache(); gc.collect()
+
+raise RuntimeError("Training completed.")
+
 
 # %% [markdown]
 # ## 2.5 Generate Test Set Predictions for Submission
@@ -629,12 +801,228 @@ test_df["seg"] = generate_test_predictions(model_segformer, test_df, val_transfo
 generate_submission(test_df)
 print("Submission generated successfully!")
 
+
 # %% [markdown]
 # # 3. Adversarial attack
-# For this part, your goal is to fool your classification and/or segmentation model, using an *adversarial attack*. More specifically, the goal is build a network to perturb test images in a way that (i) they look unperturbed to humans; but (ii) the original model classifies/segments these images in line with the perturbations.
+# Goal: Build an encoder-decoder network to perturb test images so they are misclassified 
+# while remaining visually identical to humans.
 
 # %%
+def get_saliency_map(model, img_tensor, target_class):
+    """Generates a saliency map showing pixel importance for a target class."""
+    # Ensure tensor is on device and tracking gradients
+    img_tensor = img_tensor.clone().detach().to(device).requires_grad_(True)
+    
+    outputs = model(img_tensor)
+    # Target the sum of scores for the specific class across the whole spatial map
+    score = outputs[:, target_class, :, :].sum()
+    
+    model.zero_grad()
+    score.backward()
+    
+    # Saliency is the absolute maximum gradient across color channels
+    saliency, _ = torch.max(torch.abs(img_tensor.grad.data), dim=1)
+    return saliency.squeeze().cpu().numpy()
 
+def find_class_samples(loader):
+    """Scans the dataloader to find exactly one image for each of the 20 VOC object classes."""
+    samples = {}
+    target_classes = set(range(1, 21)) # Classes 1-20 (excluding 0: background and 255: ignore)
+    
+    with torch.no_grad():
+        for images, masks in loader:
+            for i in range(images.size(0)):
+                img = images[i]
+                mask = masks[i]
+                
+                # Check which classes are present in this specific image mask
+                present_classes = torch.unique(mask).cpu().numpy()
+                
+                for cls_idx in present_classes:
+                    if cls_idx in target_classes and cls_idx not in samples:
+                        # Move to CPU immediately to prevent VRAM overflow while collecting 20 images
+                        samples[cls_idx] = (img.cpu(), mask.cpu())
+                
+                # Stop early if we have found an example for all 20 classes
+                if len(samples) == 20:
+                    return samples
+                    
+    return samples
+
+# %% [markdown]
+# ## 3.2 The Adversarial Network (Generator)
+# Optimized for learning perturbations in normalized feature space.
+
+# %%
+class AdversarialGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Simple Encoder-Decoder (Bottleneck)
+        self.enc = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU()
+        )
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 3, 3, padding=1), nn.Tanh()
+        )
+
+    def forward(self, x, strength=0.05):
+        # Tanh constrains output to [-1, 1], then scaled by strength
+        return self.dec(self.enc(x)) * strength
+
+def train_adversary(generator, victim, loader, target_class=1, epochs=5):
+    """Trains the generator with higher initial strength to ensure potency."""
+    optimizer = torch.optim.Adam(generator.parameters(), lr=1e-3)
+    victim.eval()
+    for param in victim.parameters():
+        param.requires_grad = False
+        
+    scaler = torch.amp.GradScaler('cuda')
+    
+    for epoch in range(epochs):
+        pbar = tqdm(loader, desc=f"Training Adversary Epoch {epoch+1}")
+        for images, _ in pbar:
+            images = images.to(device)
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast('cuda'):
+                # Training with a slightly higher strength (0.3) helps the 
+                # generator find more potent adversarial directions.
+                delta = generator(images, strength=0.3) 
+                perturbed = torch.clamp(images + delta, -2.5, 2.5)
+                outputs = victim(perturbed)
+                
+                target = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
+                                    target_class, dtype=torch.long, device=device)
+                
+                loss = F.cross_entropy(outputs, target) + 0.5 * torch.mean(delta**2)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+# %% [markdown]
+# ## 3.3 Execution and Visual Analysis
+
+# %%
+# Clear lingering cache before allocating models
+torch.cuda.empty_cache(); gc.collect()
+
+# Initialize and Train
+adv_gen = AdversarialGenerator().to(device)
+
+# Using SegFormer as the victim
+hf_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/mit-b2", num_labels=21)
+victim_model = SegFormerWrapper(hf_model).to(device)
+# Ensure you have your trained weights available
+if os.path.exists("best_segformer.pt"):
+    victim_model.load_state_dict(torch.load("best_segformer.pt", weights_only=True, map_location=device))
+
+# --- CRITICAL MEMORY FIX 4: Lower batch_size to 2 (from 4) ---
+train_loader, val_loader = get_dataloaders("segformer", batch_size=2)
+train_adversary(adv_gen, victim_model, train_loader)
+
+# %%
+import matplotlib.gridspec as gridspec
+
+def run_adversarial_suite(generator, victim, samples_dict):
+    """
+    Creates a single consolidated visualization with minimized vertical gaps.
+    """
+    num_classes = len(samples_dict)
+    
+    # Reduced the vertical multiplier (from 5 to 3.5) to physically shorten the figure
+    fig = plt.figure(figsize=(30, 3.5 * num_classes))
+    
+    # hspace=0.05 significantly reduces the gap between rows
+    outer_gs = gridspec.GridSpec(num_classes, 1, figure=fig, hspace=0.1)
+    
+    levels = {
+        "Baseline": 0.0, 
+        "Minor (Invisible)": 0.05, 
+        "Extreme (Visible)": 1.2
+    }
+    
+    mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    
+    width_ratios = [0.6, 1, 1, 1, 0.2, 1, 1, 1, 0.2, 1, 1, 1]
+    col_mappings = [[1, 2, 3], [5, 6, 7], [9, 10, 11]]
+    
+    sorted_keys = sorted(samples_dict.keys())
+    
+    for row_idx, cls_idx in enumerate(sorted_keys):
+        img, mask = samples_dict[cls_idx]
+        img_t = img.unsqueeze(0).to(device)
+        class_name = VOC_CLASSES[cls_idx].upper()
+        
+        # wspace controls the horizontal gaps within a row
+        inner_gs = gridspec.GridSpecFromSubplotSpec(1, 12, subplot_spec=outer_gs[row_idx], 
+                                                    width_ratios=width_ratios, wspace=0.1)
+        
+        # --- COLUMN 1: CLASS NAME ---
+        ax_title = fig.add_subplot(inner_gs[0, 0])
+        ax_title.text(0.5, 0.5, class_name, fontsize=16, fontweight='bold', 
+                      va='center', ha='center')
+        ax_title.axis('off')
+
+        for i, (level_name, s) in enumerate(levels.items()):
+            delta = generator(img_t, strength=s) if s > 0 else torch.zeros_like(img_t)
+            perturbed = torch.clamp(img_t + delta, -3.0, 3.0)
+            
+            with torch.no_grad():
+                outputs = victim(perturbed)
+                pred = torch.argmax(outputs, dim=1).squeeze().cpu().numpy()
+
+            vis_img = np.clip(perturbed.squeeze().detach().cpu().numpy().transpose(1, 2, 0) * std + mean, 0, 1)
+            vis_delta = np.clip(delta.squeeze().detach().cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1)
+            
+            target_cols = col_mappings[i]
+            labels = ["Perturbation", "Attack Image", "Prediction"]
+            plot_data = [vis_delta, vis_img, pred]
+            
+            for sub_idx, col in enumerate(target_cols):
+                ax = fig.add_subplot(inner_gs[0, col])
+                if sub_idx == 2:
+                    ax.imshow(plot_data[sub_idx], cmap='nipy_spectral', vmin=0, vmax=20)
+                else:
+                    ax.imshow(plot_data[sub_idx])
+                
+                # Group headers: only on top row, and adjusted vertical position (1.15)
+                if row_idx == 0 and sub_idx == 1:
+                    ax.text(0.5, 1.15, level_name, transform=ax.transAxes, 
+                            fontsize=16, fontweight='bold', ha='center', 
+                            bbox=dict(facecolor='lightgray', alpha=0.8, boxstyle='round,pad=0.3'))
+                
+                # Removed individual sub-titles for all rows except the first to save space
+                if row_idx == 0:
+                    ax.set_title(labels[sub_idx], fontsize=10)
+                
+                ax.axis('off')
+
+    # Manual adjustment to finalize the removal of white space at the edges
+    plt.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.9, wspace=0.1, hspace=0.1)
+    plt.savefig("adversarial_compact.png", dpi=120, bbox_inches='tight')
+    plt.show()
+
+# ==========================================
+# Execution and Visualization Loop
+# ==========================================
+
+# Ensure everything is in memory
+victim_model.eval()
+adv_gen.eval()
+
+# 1. Collect samples
+print("Gathering class-representative images...")
+all_samples = find_class_samples(val_loader)
+
+# 2. Run the master visualization
+if len(all_samples) > 0:
+    run_adversarial_suite(adv_gen, victim_model, all_samples)
+else:
+    print("Error: No class samples found. Check dataloader.")
 
 # %% [markdown] jp-MarkdownHeadingCollapsed=true
 # # 4. Discussion
