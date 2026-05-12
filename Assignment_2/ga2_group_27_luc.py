@@ -810,54 +810,62 @@ print("Submission generated successfully!")
 # %%
 def get_saliency_map(model, img_tensor, target_class):
     """Generates a saliency map showing pixel importance for a target class."""
-    # Ensure tensor is on device and tracking gradients
     img_tensor = img_tensor.clone().detach().to(device).requires_grad_(True)
-    
     outputs = model(img_tensor)
-    # Target the sum of scores for the specific class across the whole spatial map
     score = outputs[:, target_class, :, :].sum()
-    
     model.zero_grad()
     score.backward()
-    
-    # Saliency is the absolute maximum gradient across color channels
     saliency, _ = torch.max(torch.abs(img_tensor.grad.data), dim=1)
     return saliency.squeeze().cpu().numpy()
 
 def find_class_samples(loader):
     """Scans the dataloader to find exactly one image for each of the 20 VOC object classes."""
     samples = {}
-    target_classes = set(range(1, 21)) # Classes 1-20 (excluding 0: background and 255: ignore)
+    target_classes = set(range(1, 21)) # Classes 1-20
     
     with torch.no_grad():
         for images, masks in loader:
             for i in range(images.size(0)):
                 img = images[i]
                 mask = masks[i]
-                
-                # Check which classes are present in this specific image mask
                 present_classes = torch.unique(mask).cpu().numpy()
                 
                 for cls_idx in present_classes:
                     if cls_idx in target_classes and cls_idx not in samples:
-                        # Move to CPU immediately to prevent VRAM overflow while collecting 20 images
+                        # Store to CPU to avoid VRAM bloat
                         samples[cls_idx] = (img.cpu(), mask.cpu())
                 
-                # Stop early if we have found an example for all 20 classes
                 if len(samples) == 20:
                     return samples
-                    
     return samples
+
+def prepare_mask2former_targets(masks_tensor, ignore_index=255):
+    """Helper to convert standard masks to Mask2Former binary object targets."""
+    mask_labels, class_labels = [], []
+    for mask in masks_tensor:
+        classes = torch.unique(mask)
+        classes = classes[classes != ignore_index]
+        
+        b_masks, b_classes = [], []
+        for c in classes:
+            b_masks.append(mask == c)
+            b_classes.append(c)
+            
+        if not b_masks: 
+            b_masks.append(torch.zeros_like(mask, dtype=torch.bool))
+            b_classes.append(torch.tensor(0, device=mask.device))
+            
+        mask_labels.append(torch.stack(b_masks).to(torch.float32))
+        class_labels.append(torch.stack(b_classes).to(torch.int64))
+    return mask_labels, class_labels
 
 # %% [markdown]
 # ## 3.2 The Adversarial Network (Generator)
-# Optimized for learning perturbations in normalized feature space.
 
 # %%
 class AdversarialGenerator(nn.Module):
     def __init__(self):
         super().__init__()
-        # Simple Encoder-Decoder (Bottleneck)
         self.enc = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU()
@@ -868,11 +876,10 @@ class AdversarialGenerator(nn.Module):
         )
 
     def forward(self, x, strength=0.05):
-        # Tanh constrains output to [-1, 1], then scaled by strength
         return self.dec(self.enc(x)) * strength
 
-def train_adversary(generator, victim, loader, target_class=1, epochs=5):
-    """Trains the generator with higher initial strength to ensure potency."""
+def train_adversary(generator, victim, loader, model_type="segformer", target_class=1, epochs=5):
+    """Trains the generator dynamically based on the victim's architecture."""
     optimizer = torch.optim.Adam(generator.parameters(), lr=1e-3)
     victim.eval()
     for param in victim.parameters():
@@ -881,90 +888,70 @@ def train_adversary(generator, victim, loader, target_class=1, epochs=5):
     scaler = torch.amp.GradScaler('cuda')
     
     for epoch in range(epochs):
-        pbar = tqdm(loader, desc=f"Training Adversary Epoch {epoch+1}")
+        pbar = tqdm(loader, desc=f"Training {model_type.upper()} Adversary Epoch {epoch+1}")
         for images, _ in pbar:
             images = images.to(device)
             optimizer.zero_grad()
             
             with torch.amp.autocast('cuda'):
-                # Training with a slightly higher strength (0.3) helps the 
-                # generator find more potent adversarial directions.
                 delta = generator(images, strength=0.3) 
                 perturbed = torch.clamp(images + delta, -2.5, 2.5)
-                outputs = victim(perturbed)
                 
-                target = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
-                                    target_class, dtype=torch.long, device=device)
+                # --- Architecture-Specific Attack Logic ---
+                if model_type == "segformer":
+                    outputs = victim(perturbed)
+                    target = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
+                                        target_class, dtype=torch.long, device=device)
+                    loss_task = F.cross_entropy(outputs, target)
+                    
+                elif model_type == "mask2former":
+                    # Mask2Former requires attacking the internal match-loss directly
+                    adv_mask = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
+                                          target_class, dtype=torch.long, device=device)
+                    mask_labels, class_labels = prepare_mask2former_targets(adv_mask)
+                    outputs = victim(pixel_values=perturbed, mask_labels=mask_labels, class_labels=class_labels)
+                    loss_task = outputs.loss
                 
-                loss = F.cross_entropy(outputs, target) + 0.5 * torch.mean(delta**2)
+                loss = loss_task + 0.5 * torch.mean(delta**2)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
 # %% [markdown]
 # ## 3.3 Execution and Visual Analysis
 
 # %%
-# Clear lingering cache before allocating models
-torch.cuda.empty_cache(); gc.collect()
-
-# Initialize and Train
-adv_gen = AdversarialGenerator().to(device)
-
-# Using SegFormer as the victim
-hf_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/mit-b2", num_labels=21)
-victim_model = SegFormerWrapper(hf_model).to(device)
-# Ensure you have your trained weights available
-if os.path.exists("best_segformer.pt"):
-    victim_model.load_state_dict(torch.load("best_segformer.pt", weights_only=True, map_location=device))
-
-# --- CRITICAL MEMORY FIX 4: Lower batch_size to 2 (from 4) ---
-train_loader, val_loader = get_dataloaders("segformer", batch_size=2)
-train_adversary(adv_gen, victim_model, train_loader)
-
-# %%
 import matplotlib.gridspec as gridspec
 
-def run_adversarial_suite(generator, victim, samples_dict):
-    """
-    Creates a single consolidated visualization with minimized vertical gaps.
-    """
+def run_adversarial_suite(generator, victim, samples_dict, model_type="segformer", filename="adversarial_compact.png"):
+    """Creates a single consolidated visualization with minimized vertical gaps."""
     num_classes = len(samples_dict)
-    
-    # Reduced the vertical multiplier (from 5 to 3.5) to physically shorten the figure
     fig = plt.figure(figsize=(30, 3.5 * num_classes))
-    
-    # hspace=0.05 significantly reduces the gap between rows
     outer_gs = gridspec.GridSpec(num_classes, 1, figure=fig, hspace=0.1)
     
-    levels = {
-        "Baseline": 0.0, 
-        "Minor (Invisible)": 0.05, 
-        "Extreme (Visible)": 1.2
-    }
-    
+    levels = {"Baseline": 0.0, "Minor (Invisible)": 0.05, "Extreme (Visible)": 1.2}
     mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
-    
     width_ratios = [0.6, 1, 1, 1, 0.2, 1, 1, 1, 0.2, 1, 1, 1]
     col_mappings = [[1, 2, 3], [5, 6, 7], [9, 10, 11]]
-    
     sorted_keys = sorted(samples_dict.keys())
+    
+    if model_type == "mask2former":
+        processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
     
     for row_idx, cls_idx in enumerate(sorted_keys):
         img, mask = samples_dict[cls_idx]
         img_t = img.unsqueeze(0).to(device)
         class_name = VOC_CLASSES[cls_idx].upper()
         
-        # wspace controls the horizontal gaps within a row
         inner_gs = gridspec.GridSpecFromSubplotSpec(1, 12, subplot_spec=outer_gs[row_idx], 
                                                     width_ratios=width_ratios, wspace=0.1)
         
-        # --- COLUMN 1: CLASS NAME ---
+        # --- CLASS NAME ---
         ax_title = fig.add_subplot(inner_gs[0, 0])
-        ax_title.text(0.5, 0.5, class_name, fontsize=16, fontweight='bold', 
-                      va='center', ha='center')
+        ax_title.text(0.5, 0.5, class_name, fontsize=16, fontweight='bold', va='center', ha='center')
         ax_title.axis('off')
 
         for i, (level_name, s) in enumerate(levels.items()):
@@ -972,57 +959,109 @@ def run_adversarial_suite(generator, victim, samples_dict):
             perturbed = torch.clamp(img_t + delta, -3.0, 3.0)
             
             with torch.no_grad():
-                outputs = victim(perturbed)
-                pred = torch.argmax(outputs, dim=1).squeeze().cpu().numpy()
+                if model_type == "segformer":
+                    outputs = victim(perturbed)
+                    pred = torch.argmax(outputs, dim=1).squeeze().cpu().numpy()
+                elif model_type == "mask2former":
+                    outputs = victim(pixel_values=perturbed)
+                    pred = processor.post_process_semantic_segmentation(outputs, target_sizes=[img_t.shape[2:]])[0].cpu().numpy()
+
+            # ==========================================
+            # CRITICAL FIX FOR MASK2FORMER VISUALIZATION
+            # ==========================================
+            # 1. Force the Albumentations padding border to be background (0)
+            pred[mask.cpu().numpy() == 255] = 0
+            # 2. Force any internal unassigned pixels to be background (0)
+            pred[pred == 255] = 0
 
             vis_img = np.clip(perturbed.squeeze().detach().cpu().numpy().transpose(1, 2, 0) * std + mean, 0, 1)
             vis_delta = np.clip(delta.squeeze().detach().cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1)
             
-            target_cols = col_mappings[i]
-            labels = ["Perturbation", "Attack Image", "Prediction"]
             plot_data = [vis_delta, vis_img, pred]
             
-            for sub_idx, col in enumerate(target_cols):
+            for sub_idx, col in enumerate(col_mappings[i]):
                 ax = fig.add_subplot(inner_gs[0, col])
                 if sub_idx == 2:
                     ax.imshow(plot_data[sub_idx], cmap='nipy_spectral', vmin=0, vmax=20)
                 else:
                     ax.imshow(plot_data[sub_idx])
                 
-                # Group headers: only on top row, and adjusted vertical position (1.15)
+                # Group headers
                 if row_idx == 0 and sub_idx == 1:
-                    ax.text(0.5, 1.15, level_name, transform=ax.transAxes, 
-                            fontsize=16, fontweight='bold', ha='center', 
-                            bbox=dict(facecolor='lightgray', alpha=0.8, boxstyle='round,pad=0.3'))
+                    ax.text(0.5, 1.15, level_name, transform=ax.transAxes, fontsize=16, 
+                            fontweight='bold', ha='center', bbox=dict(facecolor='lightgray', alpha=0.8, boxstyle='round,pad=0.3'))
                 
-                # Removed individual sub-titles for all rows except the first to save space
                 if row_idx == 0:
-                    ax.set_title(labels[sub_idx], fontsize=10)
-                
+                    ax.set_title(["Perturbation", "Attack Image", "Prediction"][sub_idx], fontsize=10)
                 ax.axis('off')
 
-    # Manual adjustment to finalize the removal of white space at the edges
     plt.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.9, wspace=0.1, hspace=0.1)
-    plt.savefig("adversarial_compact.png", dpi=120, bbox_inches='tight')
+    plt.savefig(filename, dpi=120, bbox_inches='tight')
     plt.show()
 
+
+# %%
 # ==========================================
-# Execution and Visualization Loop
+# 1. SegFormer Attack Pipeline
 # ==========================================
+print("\n" + "="*50 + "\nINITIATING SEGFORMER ATTACK\n" + "="*50)
+torch.cuda.empty_cache(); gc.collect()
 
-# Ensure everything is in memory
-victim_model.eval()
-adv_gen.eval()
+adv_gen_sf = AdversarialGenerator().to(device)
+hf_sf = SegformerForSemanticSegmentation.from_pretrained("nvidia/mit-b2", num_labels=21)
+victim_sf = SegFormerWrapper(hf_sf).to(device)
+if os.path.exists("best_segformer.pt"):
+    victim_sf.load_state_dict(torch.load("best_segformer.pt", weights_only=True, map_location=device))
 
-# 1. Collect samples
-print("Gathering class-representative images...")
-all_samples = find_class_samples(val_loader)
+train_loader_sf, val_loader_sf = get_dataloaders("segformer", batch_size=2)
+print("Gathering class-representative images for SegFormer...")
+samples_sf = find_class_samples(val_loader_sf)
 
-# 2. Run the master visualization
-if len(all_samples) > 0:
-    run_adversarial_suite(adv_gen, victim_model, all_samples)
-else:
-    print("Error: No class samples found. Check dataloader.")
+if samples_sf:
+    train_adversary(adv_gen_sf, victim_sf, train_loader_sf, model_type="segformer")
+
+# %%
+if samples_sf:
+    run_adversarial_suite(adv_gen_sf, victim_sf, samples_sf, model_type="segformer", filename="adversarial_segformer.png")
+
+# Free memory before starting Mask2Former
+del adv_gen_sf, victim_sf, hf_sf, train_loader_sf, val_loader_sf, samples_sf
+torch.cuda.empty_cache(); gc.collect()
+
+# %%
+# ==========================================
+# 2. Mask2Former Attack Pipeline
+# ==========================================
+print("\n" + "="*50 + "\nINITIATING MASK2FORMER ATTACK\n" + "="*50)
+torch.cuda.empty_cache(); gc.collect()
+
+adv_gen_m2f = AdversarialGenerator().to(device)
+model_id = "facebook/mask2former-swin-tiny-ade-semantic"
+config = Mask2FormerConfig.from_pretrained(model_id)
+config.num_queries = 20  
+config.num_labels = 21
+victim_m2f = Mask2FormerForUniversalSegmentation.from_pretrained(model_id, config=config, ignore_mismatched_sizes=True).to(device)
+
+if os.path.exists("native_mask2former.pt"):
+    victim_m2f.load_state_dict(torch.load("native_mask2former.pt", weights_only=True, map_location=device))
+
+# Use batch_size 1 for Mask2Former Attack to prevent RTX 5060 OOM
+train_loader_m2f, val_loader_m2f = get_dataloaders("mask2former", batch_size=1) 
+print("Gathering class-representative images for Mask2Former...")
+samples_m2f = find_class_samples(val_loader_m2f)
+
+if samples_m2f:
+    train_adversary(adv_gen_m2f, victim_m2f, train_loader_m2f, model_type="mask2former")
+
+# %%
+if samples_m2f:
+    run_adversarial_suite(adv_gen_m2f, victim_m2f, samples_m2f, model_type="mask2former", filename="adversarial_mask2former.png")
+
+# Final Cleanup
+del adv_gen_m2f, victim_m2f, train_loader_m2f, val_loader_m2f, samples_m2f
+torch.cuda.empty_cache(); gc.collect()
+
+# ISSUES WITH MASK2FORMER VISUALISATIONS
 
 # %% [markdown] jp-MarkdownHeadingCollapsed=true
 # # 4. Discussion
