@@ -754,8 +754,6 @@ visualize_mask2former_native(hf_m2f, val_loader, save_name="native_mask2former")
 del hf_m2f, optimizer_m2f, train_loader, val_loader
 torch.cuda.empty_cache(); gc.collect()
 
-raise RuntimeError("Training completed.")
-
 
 # %% [markdown]
 # ## 2.5 Generate Test Set Predictions for Submission
@@ -922,18 +920,42 @@ def train_adversary(generator, victim, loader, model_type="segformer", target_cl
 # %% [markdown]
 # ## 3.3 Execution and Visual Analysis
 
+# %% [markdown]
+# The reason the artifacts appear much harsher on Mask2Former than on SegFormer at the exact same $\epsilon$ level is tied to the Feature Resolution and the Backbone Sensitivity.
+#
+# Why Mask2Former looks "messier"
+#
+# * Backbone Architecture: SegFormer (MiT-B2) uses a more traditional hierarchical transformer that naturally smooths local pixel relationships. Mask2Former, especially if using a Swin-Transformer backbone, is highly sensitive to the Pixel Decoder stage. The adversary has to "scream" much louder in the high-frequency space to disrupt the query-matching process, leading to those jagged, high-contrast artifacts you see.
+#
+# * The Query Bottleneck: To fool Mask2Former, the perturbation doesn't just need to flip a pixel; it needs to fundamentally change the Query Embeddings. This often requires "structural" noise that clashes with the natural edges of the image, making it much more obvious to a human observer.Tuning the LevelsTo achieve a "visible but recognizable" result for Mask2Former—similar to what you saw with SegFormer—you should lower the epsilon for the extreme case. Mask2Former usually "breaks" structurally at a much lower threshold.
+
 # %%
 import matplotlib.gridspec as gridspec
 
 def run_adversarial_suite(generator, victim, samples_dict, model_type="segformer", filename="adversarial_compact.png"):
-    """Creates a single consolidated visualization with minimized vertical gaps."""
+    """
+    Creates a single consolidated visualization with minimized vertical gaps.
+    """
     num_classes = len(samples_dict)
     fig = plt.figure(figsize=(30, 3.5 * num_classes))
     outer_gs = gridspec.GridSpec(num_classes, 1, figure=fig, hspace=0.1)
     
-    levels = {"Baseline": 0.0, "Minor (Invisible)": 0.05, "Extreme (Visible)": 1.2}
+    if model_type == "segformer":
+        levels = {
+            "Baseline": 0.0, 
+            "Minor (Invisible)": 0.05, 
+            "Extreme (Visible)": 1.0
+        }
+    else:
+        levels = {
+            "Baseline": 0.0, 
+            "Minor (Invisible)": 0.05, 
+            "Extreme (Visible)": 0.4
+        }
+    
     mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
     std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    
     width_ratios = [0.6, 1, 1, 1, 0.2, 1, 1, 1, 0.2, 1, 1, 1]
     col_mappings = [[1, 2, 3], [5, 6, 7], [9, 10, 11]]
     sorted_keys = sorted(samples_dict.keys())
@@ -949,9 +971,10 @@ def run_adversarial_suite(generator, victim, samples_dict, model_type="segformer
         inner_gs = gridspec.GridSpecFromSubplotSpec(1, 12, subplot_spec=outer_gs[row_idx], 
                                                     width_ratios=width_ratios, wspace=0.1)
         
-        # --- CLASS NAME ---
+        # --- COLUMN 1: CLASS NAME ---
         ax_title = fig.add_subplot(inner_gs[0, 0])
-        ax_title.text(0.5, 0.5, class_name, fontsize=16, fontweight='bold', va='center', ha='center')
+        ax_title.text(0.5, 0.5, class_name, fontsize=16, fontweight='bold', 
+                      va='center', ha='center')
         ax_title.axis('off')
 
         for i, (level_name, s) in enumerate(levels.items()):
@@ -965,21 +988,23 @@ def run_adversarial_suite(generator, victim, samples_dict, model_type="segformer
                 elif model_type == "mask2former":
                     outputs = victim(pixel_values=perturbed)
                     pred = processor.post_process_semantic_segmentation(outputs, target_sizes=[img_t.shape[2:]])[0].cpu().numpy()
+                    
+                    # --- CRITICAL ARCHITECTURE FIX ---
+                    # Mask2Former outputs '21' for pixels with no confident object mask.
+                    # In PASCAL VOC, we map these 'unassigned' pixels to Background (0).
+                    pred[pred == 21] = 0
 
-            # ==========================================
-            # CRITICAL FIX FOR MASK2FORMER VISUALIZATION
-            # ==========================================
-            # 1. Force the Albumentations padding border to be background (0)
+            # Map the padding regions to background (0)
             pred[mask.cpu().numpy() == 255] = 0
-            # 2. Force any internal unassigned pixels to be background (0)
-            pred[pred == 255] = 0
 
             vis_img = np.clip(perturbed.squeeze().detach().cpu().numpy().transpose(1, 2, 0) * std + mean, 0, 1)
             vis_delta = np.clip(delta.squeeze().detach().cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1)
             
+            target_cols = col_mappings[i]
+            labels = ["Perturbation", "Attack Image", "Prediction"]
             plot_data = [vis_delta, vis_img, pred]
             
-            for sub_idx, col in enumerate(col_mappings[i]):
+            for sub_idx, col in enumerate(target_cols):
                 ax = fig.add_subplot(inner_gs[0, col])
                 if sub_idx == 2:
                     ax.imshow(plot_data[sub_idx], cmap='nipy_spectral', vmin=0, vmax=20)
@@ -988,11 +1013,13 @@ def run_adversarial_suite(generator, victim, samples_dict, model_type="segformer
                 
                 # Group headers
                 if row_idx == 0 and sub_idx == 1:
-                    ax.text(0.5, 1.15, level_name, transform=ax.transAxes, fontsize=16, 
-                            fontweight='bold', ha='center', bbox=dict(facecolor='lightgray', alpha=0.8, boxstyle='round,pad=0.3'))
+                    ax.text(0.5, 1.15, level_name, transform=ax.transAxes, 
+                            fontsize=16, fontweight='bold', ha='center', 
+                            bbox=dict(facecolor='lightgray', alpha=0.8, boxstyle='round,pad=0.3'))
                 
                 if row_idx == 0:
-                    ax.set_title(["Perturbation", "Attack Image", "Prediction"][sub_idx], fontsize=10)
+                    ax.set_title(labels[sub_idx], fontsize=10)
+                
                 ax.axis('off')
 
     plt.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.9, wspace=0.1, hspace=0.1)
@@ -1025,7 +1052,6 @@ if samples_sf:
     run_adversarial_suite(adv_gen_sf, victim_sf, samples_sf, model_type="segformer", filename="adversarial_segformer.png")
 
 # Free memory before starting Mask2Former
-del adv_gen_sf, victim_sf, hf_sf, train_loader_sf, val_loader_sf, samples_sf
 torch.cuda.empty_cache(); gc.collect()
 
 # %%
@@ -1058,10 +1084,325 @@ if samples_m2f:
     run_adversarial_suite(adv_gen_m2f, victim_m2f, samples_m2f, model_type="mask2former", filename="adversarial_mask2former.png")
 
 # Final Cleanup
-del adv_gen_m2f, victim_m2f, train_loader_m2f, val_loader_m2f, samples_m2f
 torch.cuda.empty_cache(); gc.collect()
 
 # ISSUES WITH MASK2FORMER VISUALISATIONS
+
+# %% [markdown]
+# ## 3.4 Targeted attacks: force the model to segment a class across every image
+
+# %%
+import matplotlib.patches as mpatches
+
+def verify_universal_attack(generator, victim, samples_dict, target_name, model_type="segformer", filename="universal_attack.png"):
+    """
+    Visualizes the attack pipeline across 5 columns for a curated set of images (one per class).
+    """
+    generator.eval()
+    victim.eval()
+    
+    mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    cmap = plt.get_cmap('nipy_spectral')
+    
+    if model_type == "mask2former":
+        processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
+        
+    num_images = len(samples_dict)
+    fig, axs = plt.subplots(num_images, 5, figsize=(25, 5 * num_images))
+    if num_images == 1:
+        axs = np.expand_dims(axs, axis=0)
+        
+    fig.suptitle(f"Universal Targeted Attack: FORCE TO '{target_name.upper()}' ({model_type.upper()})", fontsize=26, fontweight='bold', y=1.01)
+
+    attack_strength = 1.0 if model_type == "segformer" else 0.4
+    
+    for row_idx, cls_idx in enumerate(sorted(samples_dict.keys())):
+        img_cpu, mask_cpu = samples_dict[cls_idx]
+        img = img_cpu.unsqueeze(0).to(device)
+        mask = mask_cpu.numpy()
+        class_original = VOC_CLASSES[cls_idx].capitalize()
+        
+        # ==========================================
+        # 1. Clean Prediction
+        # ==========================================
+        with torch.no_grad():
+            if model_type == "segformer":
+                out_c = victim(img)
+                pred_c = torch.argmax(out_c, dim=1).cpu().numpy()[0]
+            elif model_type == "mask2former":
+                out_c = victim(pixel_values=img)
+                pred_c = torch.stack(processor.post_process_semantic_segmentation(out_c, target_sizes=[img.shape[2:]])).cpu().numpy()[0]
+                pred_c[pred_c == 21] = 0
+        
+        # ==========================================
+        # 2. Attack Execution
+        # ==========================================
+        delta = generator(img, strength=attack_strength)
+        perturbed = torch.clamp(img + delta, -3.0, 3.0)
+        
+        # ==========================================
+        # 3. Attacked Prediction
+        # ==========================================
+        with torch.no_grad():
+            if model_type == "segformer":
+                out_a = victim(perturbed)
+                pred_a = torch.argmax(out_a, dim=1).cpu().numpy()[0]
+            elif model_type == "mask2former":
+                out_a = victim(pixel_values=perturbed)
+                pred_a = torch.stack(processor.post_process_semantic_segmentation(out_a, target_sizes=[img.shape[2:]])).cpu().numpy()[0]
+                pred_a[pred_a == 21] = 0
+
+        # ==========================================
+        # 4. Format Visuals
+        # ==========================================
+        vis_orig = np.clip(img.squeeze().detach().cpu().numpy().transpose(1, 2, 0) * std + mean, 0, 1)
+        vis_attack = np.clip(perturbed.squeeze().detach().cpu().numpy().transpose(1, 2, 0) * std + mean, 0, 1)
+        vis_delta = np.clip(delta.squeeze().detach().cpu().numpy().transpose(1, 2, 0) + 0.5, 0, 1)
+        
+        # Handle Padding
+        pred_c[mask == 255] = 0
+        pred_a[mask == 255] = 0
+        
+        # --- Column 1: Original Image ---
+        axs[row_idx, 0].imshow(vis_orig)
+        axs[row_idx, 0].set_title(f"1. Original ({class_original})", fontsize=14)
+        axs[row_idx, 0].axis('off')
+        
+        # --- Column 2: Unperturbed Prediction ---
+        axs[row_idx, 1].imshow(pred_c, cmap='nipy_spectral', vmin=0, vmax=20)
+        axs[row_idx, 1].set_title("2. Clean Prediction", fontsize=14)
+        axs[row_idx, 1].axis('off')
+        u_c = np.unique(pred_c)
+        axs[row_idx, 1].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_c], loc='best', fontsize=9, framealpha=0.7)
+        
+        # --- Column 3: Perturbed Image ---
+        axs[row_idx, 2].imshow(vis_attack)
+        axs[row_idx, 2].set_title(f"3. Perturbed Image (ε={attack_strength})", fontsize=14)
+        axs[row_idx, 2].axis('off')
+        
+        # --- Column 4: Perturbation Signal ---
+        axs[row_idx, 3].imshow(vis_delta)
+        axs[row_idx, 3].set_title("4. Perturbation Signal", fontsize=14)
+        axs[row_idx, 3].axis('off')
+        
+        # --- Column 5: Attacked Prediction ---
+        axs[row_idx, 4].imshow(pred_a, cmap='nipy_spectral', vmin=0, vmax=20)
+        axs[row_idx, 4].set_title("5. Attacked Prediction", fontsize=14)
+        axs[row_idx, 4].axis('off')
+        u_a = np.unique(pred_a)
+        axs[row_idx, 4].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_a], loc='best', fontsize=9, framealpha=0.7)
+        
+    plt.tight_layout()
+    plt.savefig(filename, dpi=120, bbox_inches='tight')
+    plt.show()
+
+
+# %%
+# 1. Choose your target class
+TARGET_CLASS_NAME = "aeroplane"  # Try "cat", "train", "sofa", etc.
+
+# 2. Train the specific attack (Using SegFormer as an example)
+class_generator = create_targeted_attack(
+    victim_model=victim_sf, 
+    train_loader=train_loader_sf, 
+    target_name=TARGET_CLASS_NAME, 
+    model_type="segformer",
+    epochs=10  # Increase to 10 if the model is resisting the attack
+)
+
+# %%
+# 3. Verify it works on a random batch of images
+verify_universal_attack(
+    generator=class_generator, 
+    victim=victim_sf, 
+    val_loader=val_loader_sf, 
+    target_name=TARGET_CLASS_NAME,
+    model_type="segformer"
+)
+
+
+# %%
+def evaluate_attack_success(generator, victim, val_loader, target_name, model_type="segformer", eval_batches=10):
+    """
+    Evaluates the numerical success of a targeted adversarial attack.
+    
+    Args:
+        eval_batches: How many batches to evaluate (to save time in the loop). 
+                      Set to len(val_loader) for full dataset evaluation.
+    """
+    generator.eval()
+    victim.eval()
+    
+    target_idx = VOC_CLASSES.index(target_name)
+    attack_strength = 1.0 if model_type == "segformer" else 0.4
+    
+    if model_type == "mask2former":
+        processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
+        
+    total_eligible_pixels = 0
+    successful_attack_pixels = 0
+    conf_matrix = torch.zeros(21, 21, dtype=torch.int64)
+    
+    with torch.no_grad():
+        for i, (images, masks) in enumerate(val_loader):
+            if i >= eval_batches:
+                break
+                
+            images = images.to(device)
+            
+            # 1. Generate Attack
+            delta = generator(images, strength=attack_strength)
+            perturbed = torch.clamp(images + delta, -3.0, 3.0)
+            
+            # 2. Get Attacked Predictions
+            if model_type == "segformer":
+                outputs = victim(perturbed)
+                preds = torch.argmax(outputs, dim=1).cpu()
+            elif model_type == "mask2former":
+                outputs = victim(pixel_values=perturbed)
+                target_sizes = [images.shape[2:] for _ in range(images.shape[0])]
+                preds = torch.stack(processor.post_process_semantic_segmentation(outputs, target_sizes=target_sizes)).cpu()
+                preds[preds == 21] = 0 # Handle unassigned pixels
+                
+            mask_flat = masks.view(-1).long()
+            pred_flat = preds.view(-1).long()
+            
+            # 3. Calculate Attack Success Rate (ASR)
+            valid_indices = (mask_flat != 255)
+            # We only count pixels that were NOT originally the target class
+            eligible_indices = valid_indices & (mask_flat != target_idx)
+            
+            total_eligible_pixels += eligible_indices.sum().item()
+            successful_attack_pixels += (pred_flat[eligible_indices] == target_idx).sum().item()
+            
+            # 4. Calculate Degraded mIoU (Compared to Ground Truth)
+            conf_matrix += torch.bincount(
+                21 * mask_flat[valid_indices] + pred_flat[valid_indices], 
+                minlength=21**2
+            ).reshape(21, 21)
+
+    # Final Metrics
+    asr = (successful_attack_pixels / max(total_eligible_pixels, 1)) * 100
+    
+    tp = torch.diag(conf_matrix)
+    fp = conf_matrix.sum(dim=0) - tp
+    fn = conf_matrix.sum(dim=1) - tp
+    iou = (tp.float() / (tp + fp + fn + 1e-12)).numpy()
+    mean_iou = np.mean(iou)
+    
+    return asr, mean_iou
+
+
+# %%
+# %%
+# ==========================================
+# Loop: Universal Attack for Every Class
+# ==========================================
+import gc
+
+# 1. Gather the 20 class-representative images globally
+print("Gathering class-representative images from validation set...")
+class_samples_dict = find_class_samples(val_loader_sf)
+print(f"Found images for {len(class_samples_dict)}/20 classes.\n")
+
+# Ensure memory is completely clean
+torch.cuda.empty_cache()
+gc.collect()
+
+# Dictionary to store our numerical results
+attack_results = {"Class": [], "ASR (%)": [], "Degraded mIoU": []}
+
+# We skip index 0 ("background") to only target foreground objects
+for target_class in VOC_CLASSES[1:]:
+    print(f"\n{'='*80}")
+    print(f" Executing Universal Targeted Attack: {target_class.upper()}")
+    print(f"{'='*80}\n")
+    
+    # 2. Train the specific attack (Using SegFormer)
+    class_generator = create_targeted_attack(
+        victim_model=victim_sf, 
+        train_loader=train_loader_sf, 
+        target_name=target_class, 
+        model_type="segformer",
+        epochs=5  
+    )
+
+    # 3. Visualize the attack on the curated 20 images
+    verify_universal_attack(
+        generator=class_generator, 
+        victim=victim_sf, 
+        samples_dict=class_samples_dict, 
+        target_name=target_class,
+        model_type="segformer",
+        filename=f"universal_attack_{target_class}.png"
+    )
+    
+    # 4. Numerically Evaluate the Attack (Using first 10 batches of val_loader for speed)
+    print(f"Evaluating numerical success for {target_class.upper()}...")
+    asr, mean_iou = evaluate_attack_success(
+        generator=class_generator,
+        victim=victim_sf,
+        val_loader=val_loader_sf,
+        target_name=target_class,
+        model_type="segformer",
+        eval_batches=10 # Increase this for a more thorough evaluation
+    )
+    
+    print(f"  -> Attack Success Rate (ASR): {asr:.2f}% of pixels forced to '{target_class}'")
+    print(f"  -> Degraded Model mIoU:       {mean_iou:.4f} (Original was likely ~0.60+)")
+    
+    # Save results for the final table
+    attack_results["Class"].append(target_class)
+    attack_results["ASR (%)"].append(asr)
+    attack_results["Degraded mIoU"].append(mean_iou)
+    
+    # ==========================================
+    # CRITICAL MEMORY CLEANUP
+    # ==========================================
+    del class_generator
+    plt.close('all')
+    torch.cuda.empty_cache()
+    gc.collect()
+
+# ==========================================
+# FINAL SUMMARY REPORT
+# ==========================================
+import pandas as pd
+
+print("\n" + "="*50)
+print(" FINAL UNIVERSAL ATTACK SUMMARY REPORT")
+print("="*50)
+results_df = pd.DataFrame(attack_results)
+# Sort by Attack Success Rate to see which classes were easiest to force
+results_df = results_df.sort_values(by="ASR (%)", ascending=False).reset_index(drop=True)
+print(results_df.to_string(index=False))
+
+# %% [markdown]
+#
+#  FINAL UNIVERSAL ATTACK SUMMARY REPORT
+#
+#       Class   ASR (%)  Degraded mIoU
+#       sofa 60.864354       0.025786
+#       boat  3.696168       0.080277
+#       tvmonitor  2.539727       0.138534
+#       car  1.833709       0.144566
+#       chair  0.559239       0.287705
+#       pottedplant  0.485041       0.197031
+#       cow  0.481038       0.186725
+#       dog  0.369092       0.112621
+#       sheep  0.360145       0.138348
+#       aeroplane  0.329089       0.103639
+#       bottle  0.129366       0.075379
+#       diningtable  0.086211       0.107468
+#       bird  0.063304       0.121929
+#       bus  0.020970       0.099946
+#       train  0.004041       0.095339
+#       person  0.000513       0.077922
+#       bicycle  0.000000       0.046085
+#       cat  0.000000       0.154126
+#       horse  0.000000       0.038225
+#       motorbike  0.000000       0.043387
 
 # %% [markdown] jp-MarkdownHeadingCollapsed=true
 # # 4. Discussion
