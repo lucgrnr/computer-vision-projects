@@ -876,8 +876,7 @@ class AdversarialGenerator(nn.Module):
     def forward(self, x, strength=0.05):
         return self.dec(self.enc(x)) * strength
 
-def train_adversary(generator, victim, loader, model_type="segformer", target_class=1, epochs=5):
-    """Trains the generator dynamically based on the victim's architecture."""
+def train_adversary(generator, victim, loader, model_type="segformer", target_class=1, epochs=5, strength=0.3):
     optimizer = torch.optim.Adam(generator.parameters(), lr=1e-3)
     victim.eval()
     for param in victim.parameters():
@@ -892,10 +891,12 @@ def train_adversary(generator, victim, loader, model_type="segformer", target_cl
             optimizer.zero_grad()
             
             with torch.amp.autocast('cuda'):
-                delta = generator(images, strength=0.3) 
-                perturbed = torch.clamp(images + delta, -2.5, 2.5)
+                # FIX 1: Use the dynamic strength passed to the function
+                delta = generator(images, strength=strength) 
                 
-                # --- Architecture-Specific Attack Logic ---
+                # FIX 2: Align the clamping bounds with the evaluation bounds
+                perturbed = torch.clamp(images + delta, -3.0, 3.0) 
+                
                 if model_type == "segformer":
                     outputs = victim(perturbed)
                     target = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
@@ -903,7 +904,6 @@ def train_adversary(generator, victim, loader, model_type="segformer", target_cl
                     loss_task = F.cross_entropy(outputs, target)
                     
                 elif model_type == "mask2former":
-                    # Mask2Former requires attacking the internal match-loss directly
                     adv_mask = torch.full((images.shape[0], images.shape[2], images.shape[3]), 
                                           target_class, dtype=torch.long, device=device)
                     mask_labels, class_labels = prepare_mask2former_targets(adv_mask)
@@ -1092,11 +1092,32 @@ torch.cuda.empty_cache(); gc.collect()
 # ## 3.4 Targeted attacks: force the model to segment a class across every image
 
 # %%
+def create_targeted_attack(victim_model, train_loader, target_name, model_type="segformer", epochs=5, strength=0.3):
+    generator = AdversarialGenerator().to(device)
+    
+    if target_name not in VOC_CLASSES:
+        raise ValueError(f"Target class '{target_name}' not found in VOC_CLASSES.")
+    target_class_idx = VOC_CLASSES.index(target_name)
+    
+    train_adversary(
+        generator=generator, 
+        victim=victim_model, 
+        loader=train_loader, 
+        model_type=model_type, 
+        target_class=target_class_idx, 
+        epochs=epochs,
+        strength=strength # Pass the strength down
+    )
+    
+    return generator
+
+
+# %%
 import matplotlib.patches as mpatches
 
-def verify_universal_attack(generator, victim, samples_dict, target_name, model_type="segformer", filename="universal_attack.png"):
+def verify_universal_attack(generator, victim, target_name, val_loader=None, samples_dict=None, model_type="segformer", filename="universal_attack.png"):
     """
-    Visualizes the attack pipeline across 5 columns for a curated set of images (one per class).
+    Visualizes the attack pipeline using a provided samples_dict, or automatically pulls a batch from val_loader.
     """
     generator.eval()
     victim.eval()
@@ -1107,6 +1128,15 @@ def verify_universal_attack(generator, victim, samples_dict, target_name, model_
     
     if model_type == "mask2former":
         processor = Mask2FormerImageProcessor(ignore_index=255, do_resize=False, do_rescale=False, do_normalize=False)
+        
+    # --- FIX: Conditionally handle the inputs ---
+    if samples_dict is None:
+        if val_loader is None:
+            raise ValueError("You must provide either 'val_loader' or 'samples_dict'.")
+        # Extract one real validation batch and map it to a temporary dict format
+        images_batch, masks_batch = next(iter(val_loader))
+        samples_dict = {i: (images_batch[i], masks_batch[i]) for i in range(images_batch.size(0))}
+    # -------------------------------------------
         
     num_images = len(samples_dict)
     fig, axs = plt.subplots(num_images, 5, figsize=(25, 5 * num_images))
@@ -1121,7 +1151,9 @@ def verify_universal_attack(generator, victim, samples_dict, target_name, model_
         img_cpu, mask_cpu = samples_dict[cls_idx]
         img = img_cpu.unsqueeze(0).to(device)
         mask = mask_cpu.numpy()
-        class_original = VOC_CLASSES[cls_idx].capitalize()
+        
+        # Fallback for dynamic batch extraction where class ID isn't in VOC_CLASSES range
+        class_original = VOC_CLASSES[cls_idx].capitalize() if cls_idx < len(VOC_CLASSES) else f"Image {cls_idx}"
         
         # ==========================================
         # 1. Clean Prediction
@@ -1174,7 +1206,7 @@ def verify_universal_attack(generator, victim, samples_dict, target_name, model_
         axs[row_idx, 1].set_title("2. Clean Prediction", fontsize=14)
         axs[row_idx, 1].axis('off')
         u_c = np.unique(pred_c)
-        axs[row_idx, 1].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_c], loc='best', fontsize=9, framealpha=0.7)
+        axs[row_idx, 1].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_c if c < len(VOC_CLASSES)], loc='best', fontsize=9, framealpha=0.7)
         
         # --- Column 3: Perturbed Image ---
         axs[row_idx, 2].imshow(vis_attack)
@@ -1191,7 +1223,7 @@ def verify_universal_attack(generator, victim, samples_dict, target_name, model_
         axs[row_idx, 4].set_title("5. Attacked Prediction", fontsize=14)
         axs[row_idx, 4].axis('off')
         u_a = np.unique(pred_a)
-        axs[row_idx, 4].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_a], loc='best', fontsize=9, framealpha=0.7)
+        axs[row_idx, 4].legend(handles=[mpatches.Patch(color=cmap(c/20.), label=VOC_CLASSES[c]) for c in u_a if c < len(VOC_CLASSES)], loc='best', fontsize=9, framealpha=0.7)
         
     plt.tight_layout()
     plt.savefig(filename, dpi=120, bbox_inches='tight')
@@ -1200,7 +1232,7 @@ def verify_universal_attack(generator, victim, samples_dict, target_name, model_
 
 # %%
 # 1. Choose your target class
-TARGET_CLASS_NAME = "aeroplane"  # Try "cat", "train", "sofa", etc.
+TARGET_CLASS_NAME = "sofa"  # Try "cat", "train", "sofa", etc.
 
 # 2. Train the specific attack (Using SegFormer as an example)
 class_generator = create_targeted_attack(
@@ -1208,7 +1240,7 @@ class_generator = create_targeted_attack(
     train_loader=train_loader_sf, 
     target_name=TARGET_CLASS_NAME, 
     model_type="segformer",
-    epochs=10  # Increase to 10 if the model is resisting the attack
+    epochs=5  # Increase to 10 if the model is resisting the attack
 )
 
 # %%
@@ -1216,8 +1248,8 @@ class_generator = create_targeted_attack(
 verify_universal_attack(
     generator=class_generator, 
     victim=victim_sf, 
-    val_loader=val_loader_sf, 
     target_name=TARGET_CLASS_NAME,
+    val_loader=val_loader_sf,      # Passed explicitly
     model_type="segformer"
 )
 
@@ -1313,32 +1345,56 @@ gc.collect()
 # Dictionary to store our numerical results
 attack_results = {"Class": [], "ASR (%)": [], "Degraded mIoU": []}
 
+# %%
+# ==========================================
+# Loop: Universal Attack for Every Class
+# ==========================================
+import gc
+
+# 1. Gather the 20 class-representative images globally
+print("Gathering class-representative images from validation set...")
+class_samples_dict = find_class_samples(val_loader_sf)
+print(f"Found images for {len(class_samples_dict)}/20 classes.\n")
+
+# Ensure memory is completely clean
+torch.cuda.empty_cache()
+gc.collect()
+
+# Dictionary to store our numerical results
+attack_results = {"Class": [], "ASR (%)": [], "Degraded mIoU": []}
+
+# --- YOUR UPDATED LOOP CODE GOES HERE ---
 # We skip index 0 ("background") to only target foreground objects
 for target_class in VOC_CLASSES[1:]:
     print(f"\n{'='*80}")
     print(f" Executing Universal Targeted Attack: {target_class.upper()}")
     print(f"{'='*80}\n")
     
-    # 2. Train the specific attack (Using SegFormer)
+    # Define the exact strength we will use for both training and evaluation
+    current_attack_strength = 1.0 if "segformer" == "segformer" else 0.4
+    
+    # 2. Train the specific attack 
     class_generator = create_targeted_attack(
         victim_model=victim_sf, 
-        train_loader=train_loader_sf, 
+        train_loader=val_loader_sf, # FIXED: Train on val_loader (static images)
         target_name=target_class, 
         model_type="segformer",
-        epochs=5  
+        epochs=5,
+        strength=current_attack_strength # FIXED: Synchronized training strength
     )
 
     # 3. Visualize the attack on the curated 20 images
     verify_universal_attack(
         generator=class_generator, 
         victim=victim_sf, 
+        val_loader=None, 
         samples_dict=class_samples_dict, 
         target_name=target_class,
         model_type="segformer",
         filename=f"universal_attack_{target_class}.png"
     )
     
-    # 4. Numerically Evaluate the Attack (Using first 10 batches of val_loader for speed)
+    # 4. Numerically Evaluate the Attack 
     print(f"Evaluating numerical success for {target_class.upper()}...")
     asr, mean_iou = evaluate_attack_success(
         generator=class_generator,
@@ -1346,11 +1402,11 @@ for target_class in VOC_CLASSES[1:]:
         val_loader=val_loader_sf,
         target_name=target_class,
         model_type="segformer",
-        eval_batches=10 # Increase this for a more thorough evaluation
+        eval_batches=10 
     )
     
     print(f"  -> Attack Success Rate (ASR): {asr:.2f}% of pixels forced to '{target_class}'")
-    print(f"  -> Degraded Model mIoU:       {mean_iou:.4f} (Original was likely ~0.60+)")
+    print(f"  -> Degraded Model mIoU:       {mean_iou:.4f}")
     
     # Save results for the final table
     attack_results["Class"].append(target_class)
