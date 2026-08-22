@@ -1,14 +1,15 @@
 # Computer Vision Projects
 
-Two end-to-end computer vision projects, each built around classical and modern
-techniques and delivered as a single self-contained, heavily documented notebook.
-Every notebook ships with a rendered PDF so the full write-up — code, figures and
-results — can be read without running anything.
+Three end-to-end computer vision projects, spanning classical image processing
+and modern deep learning. Each is a single self-contained, heavily documented
+notebook, delivered alongside a rendered artefact — a PDF write-up or an
+annotated video — so the results can be reviewed without running anything.
 
 | Project | What it does |
 | --- | --- |
 | [**face-detection-recognition**](face-detection-recognition/) | Finds faces in photographs and identifies who they belong to. Compares handcrafted descriptors (HOG), features learned from the data (PCA / eigenfaces) and deep face embeddings, then benchmarks a range of classifiers on top of each representation. |
 | [**segmentation-classification-attacks**](segmentation-classification-attacks/) | Understands natural scenes at two levels of granularity — which objects appear in an image, and which object each individual pixel belongs to — then attacks the resulting models with adversarial perturbations to probe how fragile they are. |
+| [**air-hockey-object-detection**](air-hockey-object-detection/) | Tracks a puck and two strikers through air hockey footage using classical computer vision alone — colour thresholding, morphology, Hough circles and template matching — and renders the result as an annotated video that narrates each technique as it is applied. |
 
 Each folder has its own README with the full method breakdown.
 
@@ -23,7 +24,11 @@ segmentation-classification-attacks/
     segmentation-classification-attacks.ipynb
     segmentation-classification-attacks.pdf   rendered write-up, 116 pages
     clip_vitb16_v2_patch.pth            fine-tuned CLIP classifier head
-environment.yml                         conda environment for both projects
+air-hockey-object-detection/
+    air-hockey-object-detection.ipynb   the processing pipeline
+    video.mp4                           source footage
+    processed-output.mp4                rendered result with subtitles
+environment.yml                         conda environment for all three projects
 ```
 
 ## Getting set up
@@ -33,7 +38,7 @@ conda env create -f environment.yml
 conda activate cv
 ```
 
-`environment.yml` covers both projects. Its header documents an older, stricter
+`environment.yml` covers all three projects. Its header documents an older, stricter
 pin set that the second project was originally validated against — worth reading
 before you rely on the exact numbers in that notebook.
 
