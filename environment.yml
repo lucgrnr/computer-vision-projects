@@ -1,7 +1,11 @@
 # Conda environment for KU Leuven H02A5a Computer Vision - Group 27
 #
-# Covers both assignments. Generated from the local `cv` conda environment,
-# with the former Assignment_2/requirements.txt folded in.
+# Covers both assignments:
+#   face-detection-recognition/          Group Assignment 1
+#   segmentation-classification-attacks/ Group Assignment 2
+#
+# Generated from the local `cv` conda environment, with the requirements.txt
+# that used to sit beside Assignment 2 folded in.
 #
 # NOTE ON ASSIGNMENT 2 PINS
 # Assignment 2 was developed and validated on Kaggle / Azure ML against an
