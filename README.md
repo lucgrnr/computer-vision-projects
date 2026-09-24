@@ -9,7 +9,7 @@ annotated video — so the results can be reviewed without running anything.
 | --- | --- |
 | [**face-detection-recognition**](face-detection-recognition/) | Finds faces in photographs and identifies who they belong to. Compares handcrafted descriptors (HOG), features learned from the data (PCA / eigenfaces) and deep face embeddings, then benchmarks a range of classifiers on top of each representation. |
 | [**segmentation-classification-attacks**](segmentation-classification-attacks/) | Understands natural scenes at two levels of granularity — which objects appear in an image, and which object each individual pixel belongs to — then attacks the resulting models with adversarial perturbations to probe how fragile they are. |
-| [**object-detection**](object-detection/) | Tracks a puck and two strikers through air hockey footage using classical computer vision alone — colour thresholding, morphology, Hough circles and template matching — and renders the result as an annotated video that narrates each technique as it is applied. |
+| [**video-edit-essentials**](video-edit-essentials/) | Contains two projects: a classical air hockey video object detection and a rabbit video editing project. Each project uses various computer vision techniques to manipulate and annotate videos. |
 
 Each folder has its own README with the full method breakdown.
 
