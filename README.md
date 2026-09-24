@@ -24,10 +24,9 @@ segmentation-classification-attacks/
     segmentation-classification-attacks.ipynb
     segmentation-classification-attacks.pdf   rendered write-up, 116 pages
     clip_vitb16_v2_patch.pth            fine-tuned CLIP classifier head
-object-detection/
-    air-hockey-object-detection.ipynb   the processing pipeline
-    video.mp4                           source footage
-    processed-output.mp4                rendered result with subtitles
+video-edit-essentials/
+    stefanos-project/                   Air Hockey Video
+    luc-project/                        Rabbit Video
 environment.yml                         conda environment for all three projects
 ```
 
